@@ -152,6 +152,8 @@ router:
     minAvailable: 1
 
   # -- Security context for router container
+  # NOTE: The default SMG image runs as root. Set runAsNonRoot: true only if
+  # your image is built with a non-root USER directive.
   securityContext:
     readOnlyRootFilesystem: true
     runAsNonRoot: false
