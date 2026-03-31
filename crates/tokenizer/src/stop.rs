@@ -4,9 +4,8 @@ use aho_corasick::AhoCorasick;
 use anyhow::Result;
 
 use crate::{
-    backend::TokenizerBackend,
     sequence::Sequence,
-    traits::{self, Decoder, TokenIdType},
+    traits::{self, TokenIdType},
 };
 
 /// Output from the sequence decoder
@@ -83,7 +82,7 @@ pub struct StopSequenceDecoder {
 impl StopSequenceDecoder {
     /// Create a new stop sequence decoder
     pub fn new(
-        tokenizer: Arc<TokenizerBackend>,
+        tokenizer: Arc<dyn traits::Tokenizer>,
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
@@ -270,13 +269,13 @@ impl StopSequenceDecoder {
 
 /// Builder for StopSequenceDecoder
 pub struct StopSequenceDecoderBuilder {
-    tokenizer: Arc<TokenizerBackend>,
+    tokenizer: Arc<dyn traits::Tokenizer>,
     config: StopSequenceConfig,
     skip_special_tokens: bool,
 }
 
 impl StopSequenceDecoderBuilder {
-    pub fn new(tokenizer: Arc<TokenizerBackend>) -> Self {
+    pub fn new(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
         StopSequenceDecoderBuilder {
             tokenizer,
             config: StopSequenceConfig::default(),
@@ -320,13 +319,12 @@ mod tests {
 
     use super::StopSequenceDecoderBuilder;
     use crate::{
-        backend::TokenizerBackend, mock::MockTokenizer, SequenceDecoderOutput,
-        StopSequenceConfig, StopSequenceDecoder,
+        mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
 
     #[test]
     fn test_stop_token_detection() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_token(999); // <eos> token
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -346,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_visible_stop_token() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_visible_stop_token(999);
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -357,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
 
         let decoder = StopSequenceDecoderBuilder::new(tokenizer)
             .stop_token(999)
@@ -372,7 +370,7 @@ mod tests {
     #[test]
     fn test_incremental_decoding_no_repetition() {
         // This test verifies the critical fix: no repeated output
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default();
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -411,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_detection() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence("test");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -431,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_flush_after_partial() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence("NEVER_MATCH");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -447,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_reset_functionality() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_token(999);
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -467,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_visible_stop_sequence() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_visible_stop_sequence("world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -487,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_multiple_tokens_processing() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default();
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -517,7 +515,7 @@ mod tests {
     ///   - Token 2: jail = "Hello world" — full match → Stopped
     #[test]
     fn test_stop_sequence_spanning_multiple_tokens() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
 
         // "Hello world" spans token 1 ("Hello") and token 2 (" world")
         let config = StopSequenceConfig::default().with_stop_sequence("Hello world");
@@ -559,7 +557,7 @@ mod tests {
     /// in the output via StoppedWithText.
     #[test]
     fn test_visible_stop_sequence_spanning_multiple_tokens() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
 
         let config = StopSequenceConfig::default().with_visible_stop_sequence("Hello world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -599,7 +597,7 @@ mod tests {
     ///     → StoppedWithText("test ") (text before the hidden stop sequence)
     #[test]
     fn test_stop_sequence_spanning_tokens_with_preceding_text() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
 
         let config = StopSequenceConfig::default().with_stop_sequence("Hello world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -652,7 +650,7 @@ mod tests {
         // that was in the middle of a multi-byte UTF-8 character (e.g., '×')
         use crate::mock::MockTokenizer;
 
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
 
         // Configure stop sequence with a multi-byte character
         let config = StopSequenceConfig::default().with_stop_sequence(" ×");
@@ -676,7 +674,7 @@ mod tests {
     fn test_utf8_multibyte_delta_character() {
         // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
         // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence("Δ");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -692,7 +690,7 @@ mod tests {
     fn test_utf8_multibyte_degree_character() {
         // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
         // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence("°");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -708,7 +706,7 @@ mod tests {
     fn test_utf8_multibyte_triangle_character() {
         // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
         // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -726,7 +724,7 @@ mod tests {
     fn test_utf8_multibyte_en_dash_character() {
         // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
         // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = StopSequenceConfig::default().with_stop_sequence(" –");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
@@ -757,7 +755,7 @@ mod tests {
         ];
 
         for (stop_char, description) in test_cases {
-            let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+            let tokenizer = Arc::new(MockTokenizer::new());
             let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
 
             let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);

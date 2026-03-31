@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::{
-    backend::TokenizerBackend,
-    traits::{Decoder, Encoder, TokenIdType},
-};
+use crate::traits::{TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -20,7 +17,7 @@ use crate::{
 ///   avoiding a redundant `decode()` on the next step.
 pub struct Sequence {
     /// The tokenizer used for encoding/decoding
-    tokenizer: Arc<TokenizerBackend>,
+    tokenizer: Arc<dyn TokenizerTrait>,
 
     /// Sliding window of token ids needed for correct incremental decoding.
     /// Consumed tokens are drained after each successful step.
@@ -68,12 +65,12 @@ impl std::fmt::Debug for Sequence {
 
 impl Sequence {
     /// Create a new empty sequence
-    pub fn new(tokenizer: Arc<TokenizerBackend>) -> Self {
+    pub fn new(tokenizer: Arc<dyn TokenizerTrait>) -> Self {
         Self::new_with_options(tokenizer, false)
     }
 
     /// Create a new empty sequence with skip_special_tokens option
-    pub fn new_with_options(tokenizer: Arc<TokenizerBackend>, skip_special_tokens: bool) -> Self {
+    pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
             tokenizer,
             token_ids: Vec::new(),
@@ -85,13 +82,13 @@ impl Sequence {
     }
 
     /// Create a sequence with initial tokens
-    pub fn with_tokens(tokenizer: Arc<TokenizerBackend>, token_ids: Vec<TokenIdType>) -> Self {
+    pub fn with_tokens(tokenizer: Arc<dyn TokenizerTrait>, token_ids: Vec<TokenIdType>) -> Self {
         Self::with_tokens_and_options(tokenizer, token_ids, false)
     }
 
     /// Create a sequence with initial tokens and skip_special_tokens option
     pub fn with_tokens_and_options(
-        tokenizer: Arc<TokenizerBackend>,
+        tokenizer: Arc<dyn TokenizerTrait>,
         token_ids: Vec<TokenIdType>,
         skip_special_tokens: bool,
     ) -> Self {
@@ -140,27 +137,59 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text.
     ///
-    /// Delegates to `TokenizerBackend::decode_step` which uses enum dispatch:
-    /// - HuggingFace: native `step_decode_stream` from the `tokenizers` crate
-    /// - Other backends: double-decode fallback with prefix caching and token draining
+    /// Uses the same algorithm as the native `DecodeStream` in the HuggingFace
+    /// `tokenizers` crate: cache the decoded prefix string between calls and
+    /// drain consumed tokens to keep memory bounded.
     #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
+        self.token_ids.push(token_id);
         self.total_tokens += 1;
-        match self.tokenizer.decode_step(
-            token_id,
-            &mut self.token_ids,
-            &mut self.cached_prefix,
-            &mut self.prefix_index,
-            self.skip_special_tokens,
-        )? {
-            Some(text) => Ok(text),
-            None => Ok(String::new()),
+
+        // If the cached prefix is empty but we have buffered tokens, compute it.
+        // This handles the first call and recovery after incomplete UTF-8.
+        if self.cached_prefix.is_empty() && self.token_ids.len() > 1 {
+            let new_prefix = self
+                .tokenizer
+                .decode(&self.token_ids[..self.token_ids.len() - 1], self.skip_special_tokens)?;
+            if !new_prefix.ends_with("�") {
+                self.prefix_index = self.token_ids.len() - 1;
+                self.cached_prefix = new_prefix;
+            }
+        }
+
+        // Decode the full buffer (prefix context + new token)
+        let string = self
+            .tokenizer
+            .decode(&self.token_ids, self.skip_special_tokens)?;
+
+        if string.len() > self.cached_prefix.len() && !string.ends_with("�") {
+            // Find the char-safe split point
+            let mut split_at = self.cached_prefix.len();
+            while !string.is_char_boundary(split_at) && split_at > 0 {
+                split_at -= 1;
+            }
+
+            let incremental_text = string[split_at..].to_string().replace("�", "");
+
+            // Drain consumed tokens and recompute the cached prefix for next call.
+            // This mirrors native DecodeStream: keeps buffer small, avoids unbounded growth.
+            let new_prefix_len = self.token_ids.len() - self.prefix_index;
+            self.token_ids.drain(..self.prefix_index);
+            self.prefix_index = new_prefix_len;
+            self.cached_prefix = self
+                .tokenizer
+                .decode(&self.token_ids, self.skip_special_tokens)?;
+
+            Ok(incremental_text)
+        } else {
+            // Incomplete UTF-8 or no new text — wait for more tokens
+            Ok(String::new())
         }
     }
 
     /// Get a reference to the tokenizer
     #[inline]
-    pub fn tokenizer(&self) -> &Arc<TokenizerBackend> {
+    pub fn tokenizer(&self) -> &Arc<dyn TokenizerTrait> {
         &self.tokenizer
     }
 
@@ -185,22 +214,20 @@ impl Sequence {
 
 #[cfg(test)]
 mod tests {
-    use crate::{backend::TokenizerBackend, mock::MockTokenizer, *};
-
-    fn mock_backend() -> Arc<TokenizerBackend> {
-        Arc::new(TokenizerBackend::Mock(MockTokenizer::new()))
-    }
+    use crate::{mock::MockTokenizer, *};
 
     #[test]
     fn test_sequence_new() {
-        let seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let seq = Sequence::new(tokenizer);
         assert!(seq.is_empty());
         assert_eq!(seq.len(), 0);
     }
 
     #[test]
     fn test_sequence_append_text() {
-        let mut seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
 
         seq.append_text("Hello", false).unwrap();
         assert!(!seq.is_empty());
@@ -211,7 +238,8 @@ mod tests {
 
     #[test]
     fn test_sequence_append_token() {
-        let mut seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer.clone());
 
         // Start with an empty sequence and append token 1 ("Hello")
         let text1 = seq.append_token(1).unwrap();
@@ -226,7 +254,8 @@ mod tests {
 
     #[test]
     fn test_sequence_clear() {
-        let mut seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
 
         seq.append_text("Hello world", false).unwrap();
         assert!(!seq.is_empty());
@@ -238,7 +267,8 @@ mod tests {
 
     #[test]
     fn test_sequence_debug() {
-        let mut seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
 
         seq.append_text("Test", false).unwrap();
         let debug_str = format!("{seq:?}");
@@ -249,7 +279,8 @@ mod tests {
     #[test]
     fn test_sequence_token_drain() {
         // Verify that the token buffer stays bounded after many appends
-        let mut seq = Sequence::new(mock_backend());
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
 
         // Append many tokens
         for i in 0..100 {

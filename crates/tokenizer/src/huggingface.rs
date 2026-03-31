@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Error, Result};
-use tokenizers::{
-    processors::template::TemplateProcessing,
-    tokenizer::{step_decode_stream, Tokenizer as HfTokenizer},
-};
+use tokenizers::{processors::template::TemplateProcessing, tokenizer::Tokenizer as HfTokenizer};
 use tracing::debug;
 
 use crate::{
@@ -258,30 +255,6 @@ impl HuggingFaceTokenizer {
             })
         })()
         .unwrap_or_default()
-    }
-
-    /// Native incremental decode using the `tokenizers` crate's `step_decode_stream`.
-    ///
-    /// This is a single-call-per-token decode that manages state internally,
-    /// drains consumed tokens, and handles UTF-8 boundaries correctly.
-    /// Only available for HuggingFace tokenizers.
-    pub fn decode_step_native(
-        &self,
-        token_id: u32,
-        ids: &mut Vec<u32>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> Result<Option<String>> {
-        step_decode_stream(
-            &self.tokenizer,
-            vec![token_id],
-            skip_special_tokens,
-            ids,
-            prefix,
-            prefix_index,
-        )
-        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
     }
 }
 

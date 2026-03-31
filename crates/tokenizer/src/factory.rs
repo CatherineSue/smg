@@ -4,10 +4,10 @@ use anyhow::{Error, Result};
 use tracing::debug;
 
 use crate::{
-    backend::TokenizerBackend,
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,
     tiktoken::{has_tiktoken_file, is_tiktoken_file, TiktokenTokenizer},
+    traits,
 };
 
 /// Represents the type of tokenizer being used
@@ -24,7 +24,7 @@ pub enum TokenizerType {
 /// Supported file types are:
 /// - json: HuggingFace tokenizer
 /// - For testing: can return mock tokenizer
-pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<TokenizerBackend>> {
+pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_with_chat_template(file_path, None)
 }
 
@@ -32,10 +32,10 @@ pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<TokenizerBacken
 pub fn create_tokenizer_with_chat_template(
     file_path: &str,
     chat_template_path: Option<&str>,
-) -> Result<Arc<TokenizerBackend>> {
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Special case for testing
     if file_path == "mock" || file_path == "test" {
-        return Ok(Arc::new(TokenizerBackend::Mock(super::mock::MockTokenizer::new())));
+        return Ok(Arc::new(super::mock::MockTokenizer::new()));
     }
 
     let path = Path::new(file_path);
@@ -67,10 +67,10 @@ pub fn create_tokenizer_with_chat_template(
         // Only forward the user's explicit chat_template_path — tiktoken handles
         // its own config/discovery (tokenizer_config.json → directory discovery).
         if has_tiktoken_file(path) {
-            return Ok(Arc::new(TokenizerBackend::Tiktoken(TiktokenTokenizer::from_dir_with_chat_template(
+            return Ok(Arc::new(TiktokenTokenizer::from_dir_with_chat_template(
                 path,
                 chat_template_path,
-            )?)));
+            )?));
         }
 
         return Err(Error::msg(format!(
@@ -89,15 +89,15 @@ pub fn create_tokenizer_with_chat_template(
             let tokenizer =
                 HuggingFaceTokenizer::from_file_with_chat_template(file_path, chat_template_path)?;
 
-            Ok(Arc::new(TokenizerBackend::HuggingFace(tokenizer)))
+            Ok(Arc::new(tokenizer) as Arc<dyn traits::Tokenizer>)
         }
         Some("model") | Some("tiktoken") => {
             // Check if it's a tiktoken file (tiktoken.model / *.tiktoken) before assuming SentencePiece
             if is_tiktoken_file(path) {
-                Ok(Arc::new(TokenizerBackend::Tiktoken(TiktokenTokenizer::from_file_with_chat_template(
+                Ok(Arc::new(TiktokenTokenizer::from_file_with_chat_template(
                     path,
                     chat_template_path,
-                )?)))
+                )?) as Arc<dyn traits::Tokenizer>)
             } else {
                 Err(Error::msg("SentencePiece models not yet supported"))
             }
@@ -116,7 +116,7 @@ pub fn create_tokenizer_with_chat_template(
 }
 
 /// Auto-detect tokenizer type by examining file content
-fn auto_detect_tokenizer(file_path: &str) -> Result<Arc<TokenizerBackend>> {
+fn auto_detect_tokenizer(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     let mut file = File::open(file_path)?;
     let mut buffer = vec![0u8; 512]; // Read first 512 bytes for detection
     let bytes_read = file.read(&mut buffer)?;
@@ -125,7 +125,7 @@ fn auto_detect_tokenizer(file_path: &str) -> Result<Arc<TokenizerBackend>> {
     // Check for JSON (HuggingFace format)
     if is_likely_json(&buffer) {
         let tokenizer = HuggingFaceTokenizer::from_file(file_path)?;
-        return Ok(Arc::new(TokenizerBackend::HuggingFace(tokenizer)));
+        return Ok(Arc::new(tokenizer));
     }
 
     // Check for GGUF magic number
@@ -256,7 +256,7 @@ fn resolve_and_log_chat_template(
 /// Factory function to create tokenizer from a model name or path (async version)
 pub async fn create_tokenizer_async(
     model_name_or_path: &str,
-) -> Result<Arc<TokenizerBackend>> {
+) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_async_with_chat_template(model_name_or_path, None).await
 }
 
@@ -314,7 +314,7 @@ fn is_likely_openai_model(name: &str) -> bool {
 pub async fn create_tokenizer_async_with_chat_template(
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
-) -> Result<Arc<TokenizerBackend>> {
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
@@ -325,7 +325,7 @@ pub async fn create_tokenizer_async_with_chat_template(
     if is_likely_openai_model(model_name_or_path) {
         // Try tiktoken first, but fall back to HuggingFace if it fails
         match TiktokenTokenizer::from_model_name(model_name_or_path) {
-            Ok(tokenizer) => return Ok(Arc::new(TokenizerBackend::Tiktoken(tokenizer))),
+            Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
                 debug!(
                     "Tiktoken failed for '{}': {}, falling back to HuggingFace",
@@ -358,10 +358,10 @@ pub async fn create_tokenizer_async_with_chat_template(
                     final_chat_template.as_deref(),
                 )
             } else if has_tiktoken_file(&cache_dir) {
-                Ok(Arc::new(TokenizerBackend::Tiktoken(TiktokenTokenizer::from_dir_with_chat_template(
+                Ok(Arc::new(TiktokenTokenizer::from_dir_with_chat_template(
                     &cache_dir,
                     chat_template_path,
-                )?)))
+                )?))
             } else {
                 // Try other common tokenizer file names
                 let possible_files = ["tokenizer_config.json", "vocab.json"];
@@ -399,7 +399,7 @@ pub async fn create_tokenizer_async_with_chat_template(
 ///
 /// This delegates to `create_tokenizer_with_chat_template_blocking` with no chat template,
 /// which handles both local files and HuggingFace Hub downloads uniformly.
-pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<TokenizerBackend>> {
+pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_with_chat_template_blocking(model_name_or_path, None)
 }
 
@@ -407,7 +407,7 @@ pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<TokenizerBackend
 pub fn create_tokenizer_with_chat_template_blocking(
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
-) -> Result<Arc<TokenizerBackend>> {
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
@@ -418,7 +418,7 @@ pub fn create_tokenizer_with_chat_template_blocking(
     // Try tiktoken first, but fall back to HuggingFace if it fails
     if is_likely_openai_model(model_name_or_path) {
         match TiktokenTokenizer::from_model_name(model_name_or_path) {
-            Ok(tokenizer) => return Ok(Arc::new(TokenizerBackend::Tiktoken(tokenizer))),
+            Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
                 debug!(
                     "Tiktoken failed for '{}': {}, falling back to HuggingFace",
@@ -488,7 +488,6 @@ mod tests {
         create_tokenizer, create_tokenizer_async, create_tokenizer_from_file, is_likely_json,
         is_likely_openai_model,
     };
-    use crate::traits::{Decoder, Encoder, Tokenizer as _};
 
     #[test]
     fn test_json_detection() {
