@@ -8,7 +8,8 @@ use axum::response::Response;
 use bytes::Bytes;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
-    traits::Tokenizer,
+    traits::{Decoder as _, Tokenizer as _},
+    TokenizerBackend,
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
@@ -88,7 +89,7 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -178,7 +179,7 @@ impl StreamingProcessor {
         &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -570,7 +571,7 @@ impl StreamingProcessor {
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -627,7 +628,7 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
     ) -> Response {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -700,7 +701,7 @@ impl StreamingProcessor {
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     /// TODO: add streaming logprob support
     async fn process_generate_streaming(
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -811,7 +812,7 @@ impl StreamingProcessor {
 
     /// Process dual streaming for generate endpoint (PD mode with logprobs support)
     async fn process_generate_streaming_dual(
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         ctx: GenerateStreamContext,
@@ -865,7 +866,7 @@ impl StreamingProcessor {
 
     /// Process generate streaming with optional input_logprobs
     async fn process_generate_streaming_with_input_logprobs(
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
@@ -1411,7 +1412,7 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
         messages_request: Arc<CreateMessageRequest>,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
     ) -> Response {
         let stop_params = (
             messages_request
@@ -1514,7 +1515,7 @@ impl StreamingProcessor {
         &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -2114,7 +2115,7 @@ impl StreamingProcessor {
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<TokenizerBackend>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use llm_tokenizer::traits::Tokenizer;
+use llm_tokenizer::{traits::{Decoder as _, Encoder as _, Tokenizer as _}, TokenizerBackend};
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
 use tracing::error;
 
@@ -90,7 +90,7 @@ impl GeneratePreparationStage {
     fn resolve_generate_input(
         &self,
         request: &GenerateRequest,
-        tokenizer: &Arc<dyn Tokenizer>,
+        tokenizer: &Arc<TokenizerBackend>,
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
             return self
@@ -122,7 +122,7 @@ impl GeneratePreparationStage {
     )]
     fn tokenize_single_text(
         &self,
-        tokenizer: &Arc<dyn Tokenizer>,
+        tokenizer: &Arc<TokenizerBackend>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         // Don't add special tokens - raw text generation uses text as-is

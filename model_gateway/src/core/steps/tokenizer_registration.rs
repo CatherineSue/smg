@@ -14,7 +14,8 @@ use llm_tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     factory,
     registry::LoadOutcome,
-    traits::Tokenizer,
+    traits::Tokenizer as _,
+    TokenizerBackend,
 };
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
@@ -194,9 +195,9 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 }
 
 fn with_optional_cache(
-    tokenizer: Arc<dyn Tokenizer>,
+    tokenizer: Arc<TokenizerBackend>,
     cache_cfg: Option<TokenizerCacheConfig>,
-) -> Arc<dyn Tokenizer> {
+) -> Arc<TokenizerBackend> {
     match cache_cfg {
         Some(cfg) if cfg.enable_l0 || cfg.enable_l1 => {
             let cache_config = CacheConfig {
@@ -205,13 +206,16 @@ fn with_optional_cache(
                 enable_l1: cfg.enable_l1,
                 l1_max_memory: cfg.l1_max_memory,
             };
-            Arc::new(CachedTokenizer::new(tokenizer, cache_config))
+            Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(
+                tokenizer,
+                cache_config,
+            )))
         }
         _ => tokenizer,
     }
 }
 
-fn load_tokenizer_from_bundle(bundle: &StreamBundle) -> Result<Arc<dyn Tokenizer>, String> {
+fn load_tokenizer_from_bundle(bundle: &StreamBundle) -> Result<Arc<TokenizerBackend>, String> {
     tokenizer_bundle::with_extracted_bundle(bundle, |tokenizer_dir| {
         let tokenizer_path = tokenizer_dir.to_string_lossy().into_owned();
         info!(
@@ -228,7 +232,7 @@ fn load_tokenizer_from_bundle(bundle: &StreamBundle) -> Result<Arc<dyn Tokenizer
 async fn fetch_tokenizer_from_worker(
     app_context: &AppContext,
     model_id: &str,
-) -> Result<Arc<dyn Tokenizer>, String> {
+) -> Result<Arc<TokenizerBackend>, String> {
     let workers = app_context.worker_registry.get_workers_filtered(
         Some(model_id),
         None,

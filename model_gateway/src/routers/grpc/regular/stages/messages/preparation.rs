@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use llm_tokenizer::traits::Encoder as _;
 use openai_protocol::{common::StringOrArray, messages::CreateMessageRequest};
 use tracing::{debug, error};
 
