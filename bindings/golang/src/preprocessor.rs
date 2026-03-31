@@ -13,7 +13,7 @@ use std::{
     ptr,
 };
 
-use llm_tokenizer::{create_tokenizer_from_file, traits::{Encoder as _, Tokenizer as _}, TokenizerBackend};
+use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{generate_tool_constraints, process_chat_messages};
 
@@ -34,7 +34,7 @@ struct PreprocessResult {
 /// Internal helper to preprocess a chat request with a given tokenizer
 fn preprocess_impl(
     chat_request: &ChatCompletionRequest,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn Tokenizer,
 ) -> Result<PreprocessResult, (SglErrorCode, String)> {
     // Process chat messages (apply chat_template)
     let processed_messages = process_chat_messages(chat_request, tokenizer, None).map_err(|e| {

@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use llm_tokenizer::{registry::TokenizerEntry, traits::{Decoder as _, Encoder as _, Tokenizer as _}, TokenizerBackend, TokenizerRegistry};
+use llm_tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::tokenize::{
     AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest, DetokenizeResponse,
     ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
@@ -38,7 +38,7 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
 }
 
 /// Get a tokenizer by model name, with fallback strategies
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<TokenizerBackend>, String> {
+fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
     // First, try exact match (by name or ID)
     if let Some(tokenizer) = registry.get(model) {
         debug!("Found tokenizer for model: {}", model);

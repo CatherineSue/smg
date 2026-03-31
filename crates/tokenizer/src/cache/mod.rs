@@ -27,7 +27,6 @@ pub use l1::{L1Cache, L1CacheStats};
 use rayon::prelude::*;
 
 use crate::{
-    backend::TokenizerBackend,
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer},
 };
@@ -56,10 +55,10 @@ impl Default for CacheConfig {
     }
 }
 
-/// A caching wrapper around any tokenizer backend
+/// A caching wrapper around any tokenizer
 pub struct CachedTokenizer {
-    /// The underlying tokenizer backend (enum dispatch preserved through cache layer)
-    inner: Arc<TokenizerBackend>,
+    /// The underlying tokenizer
+    inner: Arc<dyn Tokenizer>,
     /// L0 cache (whole-string exact match)
     l0: Option<L0Cache>,
     /// L1 cache (prefix matching at fixed boundaries)
@@ -72,7 +71,7 @@ pub struct CachedTokenizer {
 
 impl CachedTokenizer {
     /// Create a new cached tokenizer
-    pub fn new(inner: Arc<TokenizerBackend>, config: CacheConfig) -> Self {
+    pub fn new(inner: Arc<dyn Tokenizer>, config: CacheConfig) -> Self {
         let fingerprint = TokenizerFingerprint::from_tokenizer(inner.as_ref());
 
         let l0 = if config.enable_l0 {
@@ -100,7 +99,7 @@ impl CachedTokenizer {
     }
 
     /// Extract all special token strings from the tokenizer (called once at construction)
-    fn extract_special_token_strings(tokenizer: &Arc<TokenizerBackend>) -> Vec<String> {
+    fn extract_special_token_strings(tokenizer: &Arc<dyn Tokenizer>) -> Vec<String> {
         let special_tokens = tokenizer.get_special_tokens();
         let mut tokens = Vec::new();
 
@@ -155,8 +154,8 @@ impl CachedTokenizer {
         &self.fingerprint
     }
 
-    /// Get a reference to the inner (wrapped) tokenizer backend
-    pub fn inner(&self) -> &Arc<TokenizerBackend> {
+    /// Get a reference to the inner (wrapped) tokenizer
+    pub fn inner(&self) -> &Arc<dyn Tokenizer> {
         &self.inner
     }
 }
@@ -276,11 +275,11 @@ impl Tokenizer for CachedTokenizer {
 
 #[cfg(test)]
 mod tests {
-    use crate::{backend::TokenizerBackend, mock::MockTokenizer, *};
+    use crate::{mock::MockTokenizer, *};
 
     #[test]
     fn test_cache_hit() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
 
         let input = "Hello world";
@@ -302,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_cache_disabled() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
@@ -325,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_encode_batch() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
 
         let inputs = vec!["Hello", "world", "Hello"]; // "Hello" repeated
@@ -352,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_decoder_passthrough() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let cached = CachedTokenizer::new(tokenizer, CacheConfig::default());
 
         let tokens = vec![1, 2, 3];
@@ -364,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_tokenizer_trait_methods() {
-        let tokenizer = Arc::new(TokenizerBackend::Mock(MockTokenizer::new()));
+        let tokenizer = Arc::new(MockTokenizer::new());
         let cached = CachedTokenizer::new(tokenizer.clone(), CacheConfig::default());
 
         // Should pass through to inner tokenizer

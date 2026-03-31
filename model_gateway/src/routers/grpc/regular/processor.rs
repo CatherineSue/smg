@@ -7,8 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
-    traits::{Decoder as _, Tokenizer as _},
-    TokenizerBackend,
+    traits::Tokenizer,
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
@@ -62,7 +61,7 @@ impl ResponseProcessor {
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatCompletionRequest,
-        tokenizer: &Arc<TokenizerBackend>,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
@@ -198,7 +197,7 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
-        tokenizer: Arc<TokenizerBackend>,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
@@ -454,7 +453,7 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         messages_request: Arc<CreateMessageRequest>,
         dispatch: DispatchMetadata,
-        _tokenizer: Arc<TokenizerBackend>,
+        _tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, axum::response::Response> {
         // Collect all responses (no logprobs for Messages API)
@@ -718,7 +717,7 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         completion_req: Arc<CompletionRequest>,
         dispatch: DispatchMetadata,
-        _tokenizer: Arc<TokenizerBackend>,
+        _tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         prompt_text: &str,
     ) -> Result<CompletionResponse, axum::response::Response> {

@@ -6,7 +6,6 @@
 use anyhow::Result;
 
 use crate::{
-    cache::CachedTokenizer,
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     huggingface::HuggingFaceTokenizer,
     mock::MockTokenizer,
@@ -23,9 +22,6 @@ pub enum TokenizerBackend {
     HuggingFace(HuggingFaceTokenizer),
     Tiktoken(TiktokenTokenizer),
     Mock(MockTokenizer),
-    /// Caching layer wrapping another backend. Encode operations are cached;
-    /// decode and decode_step delegate through to the inner backend.
-    Cached(CachedTokenizer),
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +34,6 @@ impl traits::Encoder for TokenizerBackend {
             Self::HuggingFace(t) => t.encode(input, add_special_tokens),
             Self::Tiktoken(t) => t.encode(input, add_special_tokens),
             Self::Mock(t) => t.encode(input, add_special_tokens),
-            Self::Cached(t) => t.encode(input, add_special_tokens),
         }
     }
 
@@ -47,7 +42,6 @@ impl traits::Encoder for TokenizerBackend {
             Self::HuggingFace(t) => t.encode_batch(inputs, add_special_tokens),
             Self::Tiktoken(t) => t.encode_batch(inputs, add_special_tokens),
             Self::Mock(t) => t.encode_batch(inputs, add_special_tokens),
-            Self::Cached(t) => t.encode_batch(inputs, add_special_tokens),
         }
     }
 }
@@ -58,7 +52,6 @@ impl traits::Decoder for TokenizerBackend {
             Self::HuggingFace(t) => t.decode(token_ids, skip_special_tokens),
             Self::Tiktoken(t) => t.decode(token_ids, skip_special_tokens),
             Self::Mock(t) => t.decode(token_ids, skip_special_tokens),
-            Self::Cached(t) => t.decode(token_ids, skip_special_tokens),
         }
     }
 }
@@ -69,7 +62,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.vocab_size(),
             Self::Tiktoken(t) => t.vocab_size(),
             Self::Mock(t) => t.vocab_size(),
-            Self::Cached(t) => t.vocab_size(),
         }
     }
 
@@ -78,7 +70,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.get_special_tokens(),
             Self::Tiktoken(t) => t.get_special_tokens(),
             Self::Mock(t) => t.get_special_tokens(),
-            Self::Cached(t) => t.get_special_tokens(),
         }
     }
 
@@ -87,7 +78,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.token_to_id(token),
             Self::Tiktoken(t) => t.token_to_id(token),
             Self::Mock(t) => t.token_to_id(token),
-            Self::Cached(t) => t.token_to_id(token),
         }
     }
 
@@ -96,7 +86,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.id_to_token(id),
             Self::Tiktoken(t) => t.id_to_token(id),
             Self::Mock(t) => t.id_to_token(id),
-            Self::Cached(t) => t.id_to_token(id),
         }
     }
 
@@ -114,7 +103,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.apply_chat_template(messages, params),
             Self::Tiktoken(t) => t.apply_chat_template(messages, params),
             Self::Mock(t) => t.apply_chat_template(messages, params),
-            Self::Cached(t) => t.apply_chat_template(messages, params),
         }
     }
 
@@ -123,7 +111,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.chat_template_content_format(),
             Self::Tiktoken(t) => t.chat_template_content_format(),
             Self::Mock(t) => t.chat_template_content_format(),
-            Self::Cached(t) => t.chat_template_content_format(),
         }
     }
 
@@ -132,7 +119,6 @@ impl traits::Tokenizer for TokenizerBackend {
             Self::HuggingFace(t) => t.set_chat_template(template),
             Self::Tiktoken(t) => t.set_chat_template(template),
             Self::Mock(t) => t.set_chat_template(template),
-            Self::Cached(t) => t.set_chat_template(template),
         }
     }
 }
@@ -158,13 +144,6 @@ impl TokenizerBackend {
     ) -> Result<Option<String>> {
         match self {
             Self::HuggingFace(t) => t.decode_step_native(
-                token_id,
-                ids,
-                prefix,
-                prefix_index,
-                skip_special_tokens,
-            ),
-            Self::Cached(t) => t.inner().decode_step(
                 token_id,
                 ids,
                 prefix,
@@ -220,29 +199,6 @@ impl TokenizerBackend {
             Ok(Some(new_text))
         } else {
             Ok(None)
-        }
-    }
-
-    /// Get L0 cache statistics (returns `None` for non-cached backends).
-    pub fn cache_stats(&self) -> Option<crate::cache::CacheStats> {
-        match self {
-            Self::Cached(t) => t.cache_stats(),
-            _ => None,
-        }
-    }
-
-    /// Get L1 cache statistics (returns `None` for non-cached backends).
-    pub fn l1_cache_stats(&self) -> Option<crate::cache::L1CacheStats> {
-        match self {
-            Self::Cached(t) => t.l1_cache_stats(),
-            _ => None,
-        }
-    }
-
-    /// Clear the cache (no-op for non-cached backends).
-    pub fn clear_cache(&self) {
-        if let Self::Cached(t) = self {
-            t.clear_cache();
         }
     }
 }

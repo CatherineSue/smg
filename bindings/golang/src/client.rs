@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use llm_tokenizer::{create_tokenizer_from_file, traits::{Encoder as _, Tokenizer as _}, TokenizerBackend};
+use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{generate_tool_constraints, process_chat_messages};
 use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
@@ -25,7 +25,7 @@ use super::{
 /// This handle manages the connection to sglang and provides a complete SDK interface
 pub struct SglangClientHandle {
     pub(crate) client: Arc<SglangSchedulerClient>,
-    pub(crate) tokenizer: Arc<TokenizerBackend>,
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
 }
 
 /// Create a new SGLang client handle

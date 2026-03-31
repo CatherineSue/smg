@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 
 use async_trait::async_trait;
-use llm_tokenizer::traits::Encoder as _;
 use axum::response::Response;
 use openai_protocol::chat::ChatCompletionRequest;
 use tracing::{debug, error};

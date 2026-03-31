@@ -8,9 +8,7 @@ use std::{
 };
 
 use llm_tokenizer::{
-    chat_template::ChatTemplateParams, create_tokenizer,
-    traits::{Decoder as _, Encoder as _, Tokenizer as TokenizerTrait},
-    TokenizerBackend,
+    chat_template::ChatTemplateParams, create_tokenizer, traits::Tokenizer as TokenizerTrait,
 };
 use serde_json::Value;
 
@@ -24,12 +22,12 @@ type BooleanT = libc::c_int;
 /// Opaque handle for a tokenizer instance
 #[repr(C)]
 pub struct TokenizerHandle {
-    pub(crate) tokenizer: Arc<TokenizerBackend>,
+    pub(crate) tokenizer: Arc<dyn TokenizerTrait>,
 }
 
 /// Internal helper to apply chat template with optional tools
 fn apply_chat_template_impl(
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn TokenizerTrait,
     messages: Vec<Value>,
     tools: Option<&[Value]>,
 ) -> Result<String, (SglErrorCode, &'static str)> {

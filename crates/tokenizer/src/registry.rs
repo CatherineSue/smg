@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::{backend::TokenizerBackend, traits::Tokenizer};
+use crate::traits::Tokenizer;
 
 /// Outcome of a tokenizer load operation
 #[derive(Debug, Clone)]
@@ -73,8 +73,8 @@ pub struct TokenizerEntry {
     pub name: String,
     /// Source path or HuggingFace model ID
     pub source: String,
-    /// The tokenizer instance (enum-based dispatch for hot path optimization)
-    pub tokenizer: Arc<TokenizerBackend>,
+    /// The tokenizer instance
+    pub tokenizer: Arc<dyn Tokenizer>,
 }
 
 /// Registry for managing tokenizers keyed by UUID
@@ -144,7 +144,7 @@ impl TokenizerRegistry {
     ) -> Result<LoadOutcome, LoadError>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Arc<TokenizerBackend>, String>>,
+        Fut: std::future::Future<Output = Result<Arc<dyn Tokenizer>, String>>,
     {
         // Validate inputs
         if name.is_empty() {
@@ -227,7 +227,7 @@ impl TokenizerRegistry {
         id: &str,
         name: &str,
         source: &str,
-        tokenizer: Arc<TokenizerBackend>,
+        tokenizer: Arc<dyn Tokenizer>,
     ) -> Option<String> {
         use dashmap::mapref::entry::Entry;
 
@@ -269,7 +269,7 @@ impl TokenizerRegistry {
     }
 
     /// Get a tokenizer (for backward compatibility, tries name first then ID)
-    pub fn get(&self, name_or_id: &str) -> Option<Arc<TokenizerBackend>> {
+    pub fn get(&self, name_or_id: &str) -> Option<Arc<dyn Tokenizer>> {
         self.get_by_name(name_or_id)
             .or_else(|| self.get_by_id(name_or_id))
             .map(|e| e.tokenizer)
@@ -356,7 +356,7 @@ mod tests {
 
     use tokio::time::sleep;
 
-    use crate::{backend::TokenizerBackend, mock::MockTokenizer, LoadError, TokenizerRegistry};
+    use crate::{mock::MockTokenizer, traits::Tokenizer, LoadError, TokenizerRegistry};
 
     #[tokio::test]
     async fn test_basic_operations() {
@@ -371,7 +371,7 @@ mod tests {
         let id = TokenizerRegistry::generate_id();
         let outcome = registry
             .load(&id, "model1", "path/to/model", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
@@ -407,7 +407,7 @@ mod tests {
         // First load should return Loaded
         let outcome1 = registry
             .load(&id1, "model1", "source1", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
@@ -474,7 +474,7 @@ mod tests {
                         // Simulate slow loading
                         sleep(Duration::from_millis(10)).await;
                         load_count.fetch_add(1, Ordering::SeqCst);
-                        Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                        Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
                     })
                     .await
             });
@@ -505,7 +505,7 @@ mod tests {
             let id = TokenizerRegistry::generate_id();
             registry
                 .load(&id, &model_name, "source", || async {
-                    Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                    Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
                 })
                 .await
                 .unwrap();
@@ -550,7 +550,7 @@ mod tests {
 
         registry
             .load(&id, "my-model", "hf/model", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
@@ -575,8 +575,8 @@ mod tests {
         let registry = TokenizerRegistry::new();
         let id1 = TokenizerRegistry::generate_id();
         let id2 = TokenizerRegistry::generate_id();
-        let tokenizer1 = Arc::new(TokenizerBackend::Mock(MockTokenizer::default()));
-        let tokenizer2 = Arc::new(TokenizerBackend::Mock(MockTokenizer::default()));
+        let tokenizer1 = Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>;
+        let tokenizer2 = Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>;
 
         // First registration should succeed
         let result1 = registry.register(&id1, "model1", "source1", tokenizer1.clone());
@@ -629,7 +629,7 @@ mod tests {
         let id = TokenizerRegistry::generate_id();
         let outcome = registry
             .load(&id, "panic-model", "source", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await;
 
@@ -648,7 +648,7 @@ mod tests {
         let id1 = TokenizerRegistry::generate_id();
         registry
             .load(&id1, "model1", "source1", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();
@@ -662,7 +662,7 @@ mod tests {
         let id2 = TokenizerRegistry::generate_id();
         let outcome = registry
             .load(&id2, "model2", "source2", || async {
-                Ok(Arc::new(TokenizerBackend::Mock(MockTokenizer::default())))
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
             })
             .await
             .unwrap();

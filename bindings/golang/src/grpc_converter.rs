@@ -10,8 +10,7 @@ use std::{
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     stream::DecodeStream,
-    traits::{Decoder as _, Tokenizer as _},
-    TokenizerBackend,
+    traits::Tokenizer,
 };
 use openai_protocol::common::{
     FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
@@ -34,7 +33,7 @@ use super::{
 /// Handle for gRPC response converter (maintains state for streaming)
 #[repr(C)]
 pub struct GrpcResponseConverterHandle {
-    pub(crate) tokenizer: Arc<TokenizerBackend>,
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) tool_parser: Option<Arc<TokioMutex<Box<dyn ToolParser>>>>,
     pub(crate) stop_decoder: Option<Arc<TokioMutex<StopSequenceDecoder>>>,
     pub(crate) model: String,
@@ -301,7 +300,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
 pub(crate) async fn convert_proto_chunk_to_openai(
     proto_response: proto::GenerateResponse,
     handle: &mut GrpcResponseConverterHandle,
-    tokenizer: &Arc<TokenizerBackend>,
+    tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<Option<openai_protocol::chat::ChatCompletionStreamResponse>, String> {
     use openai_protocol::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
     use smg_grpc_client::sglang_proto::generate_response::Response::*;

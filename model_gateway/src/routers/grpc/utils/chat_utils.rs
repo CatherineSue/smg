@@ -7,8 +7,7 @@ use bytes::Bytes;
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::Tokenizer as _,
-    TokenizerBackend,
+    traits::Tokenizer,
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -56,7 +55,7 @@ pub(crate) fn send_error_sse(tx: &SseSender, message: impl ToString, error_type:
 pub(crate) fn resolve_tokenizer(
     ctx: &mut RequestContext,
     stage_name: &str,
-) -> Result<Arc<TokenizerBackend>, Box<Response>> {
+) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
     let model_id = ctx.input.model_id.as_str();
 
     let tokenizer = ctx
@@ -371,7 +370,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// Requires HuggingFace tokenizer with chat template support
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
     let formatted_text = {
@@ -474,7 +473,7 @@ pub fn process_chat_messages(
 
 /// Create a StopSequenceDecoder from stop parameters
 pub fn create_stop_decoder(
-    tokenizer: &Arc<TokenizerBackend>,
+    tokenizer: &Arc<dyn Tokenizer>,
     stop: Option<&StringOrArray>,
     stop_token_ids: Option<&Vec<u32>>,
     skip_special_tokens: bool,

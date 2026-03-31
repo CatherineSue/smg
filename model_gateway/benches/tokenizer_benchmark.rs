@@ -21,7 +21,6 @@ use std::{
 
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use llm_tokenizer::{
-    backend::TokenizerBackend,
     cache::{CacheConfig, CachedTokenizer},
     huggingface::HuggingFaceTokenizer,
     sequence::Sequence,
@@ -100,10 +99,10 @@ fn add_result(category: &str, result: String) {
 
 fn bench_encode_throughput(c: &mut Criterion) {
     let tokenizer_path = get_tokenizer_path();
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     // Pre-generate system prompts
     let system_1k = generate_system_prompt(1000);
@@ -176,10 +175,10 @@ fn bench_encode_throughput(c: &mut Criterion) {
 
 fn bench_batch_encode(c: &mut Criterion) {
     let tokenizer_path = get_tokenizer_path();
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let batch_sizes = vec![1, 8, 16, 32, 64, 128];
     let prompt = MEDIUM_PROMPT;
@@ -239,10 +238,10 @@ fn bench_batch_encode(c: &mut Criterion) {
 }
 
 fn bench_concurrent_encode(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let client_counts = vec![1, 4, 8, 16, 32];
 
@@ -325,10 +324,10 @@ fn bench_concurrent_encode(c: &mut Criterion) {
 }
 
 fn bench_decode_performance(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let test_text = "The quick brown fox jumps over the lazy dog. ".repeat(10);
     let encoding = tokenizer.encode(&test_text, false).unwrap();
@@ -444,10 +443,10 @@ fn bench_decode_performance(c: &mut Criterion) {
 }
 
 fn bench_streaming_decode_100k(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let sample_text = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
     let encoding = tokenizer.encode(&sample_text, false).unwrap();
@@ -561,10 +560,10 @@ fn bench_streaming_decode_100k(c: &mut Criterion) {
 }
 
 fn bench_latency_distribution(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     // Test latency for individual token processing
     let sample_tokens = vec![1, 450, 6635, 3290, 491, 278, 3474, 29892];
@@ -709,10 +708,10 @@ fn bench_latency_distribution(c: &mut Criterion) {
 }
 
 fn bench_concurrent_streaming(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let num_sequences = 16;
     let tokens_per_sequence = 10_000;
@@ -789,10 +788,10 @@ fn bench_concurrent_streaming(c: &mut Criterion) {
 }
 
 fn bench_stop_sequences(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let config = StopSequenceConfig::default()
         .with_stop_sequence("</s>")
@@ -903,10 +902,10 @@ fn bench_stop_sequences(c: &mut Criterion) {
 }
 
 fn bench_multithreaded_encode(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let thread_counts = vec![1, 2, 4, 8, 16];
     let operations_per_thread = 1000;
@@ -1001,10 +1000,10 @@ fn bench_multithreaded_encode(c: &mut Criterion) {
 }
 
 fn bench_multithreaded_decode(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let thread_counts = vec![1, 2, 4, 8, 16];
     let tokens_per_thread = 5000;
@@ -1102,10 +1101,10 @@ fn bench_multithreaded_decode(c: &mut Criterion) {
 }
 
 fn bench_memory_efficiency(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let large_text = "The quick brown fox jumps over the lazy dog. ".repeat(1000);
     let encoding = tokenizer.encode(&large_text, false).unwrap();
@@ -1188,10 +1187,10 @@ fn bench_memory_efficiency(c: &mut Criterion) {
 }
 
 fn bench_scaling_characteristics(c: &mut Criterion) {
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(get_tokenizer_path().to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let thread_counts = vec![1, 2, 4, 8, 16];
     let tokens_per_thread = 10000;
@@ -1276,10 +1275,10 @@ fn bench_scaling_characteristics(c: &mut Criterion) {
 
 fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let tokenizer_path = get_tokenizer_path();
-    let tokenizer = Arc::new(TokenizerBackend::HuggingFace(
+    let tokenizer = Arc::new(
         HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
             .expect("Failed to load tokenizer"),
-    ));
+    );
 
     let mut group = c.benchmark_group("l1_cache_chat");
 
@@ -1364,7 +1363,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
         enable_l1: false,
         l1_max_memory: 0,
     };
-    let cached_l0_only = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(tokenizer.clone(), l0_only_config)));
+    let cached_l0_only = Arc::new(CachedTokenizer::new(tokenizer.clone(), l0_only_config));
 
     let printed_l0 = Arc::new(AtomicBool::new(false));
     group.bench_function("realistic_chat_l0_only", |b| {
@@ -1414,10 +1413,10 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
-    let cached_l0_l1 = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(
+    let cached_l0_l1 = Arc::new(CachedTokenizer::new(
         tokenizer.clone(),
         l0_l1_config.clone(),
-    )));
+    ));
 
     let printed_l0_l1 = Arc::new(AtomicBool::new(false));
     group.bench_function("realistic_chat_l0_l1", |b| {
@@ -1503,7 +1502,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
-    let service_cached_l1 = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(tokenizer.clone(), l1_only_config)));
+    let service_cached_l1 = Arc::new(CachedTokenizer::new(tokenizer.clone(), l1_only_config));
 
     let printed_service_l1 = Arc::new(AtomicBool::new(false));
     group.bench_function("customer_service_l1_only", |b| {
@@ -1548,10 +1547,10 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     });
 
     // Service bot with L0+L1
-    let service_cached = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(
+    let service_cached = Arc::new(CachedTokenizer::new(
         tokenizer.clone(),
         l0_l1_config.clone(),
-    )));
+    ));
 
     let printed_service = Arc::new(AtomicBool::new(false));
     group.bench_function("customer_service_l0_l1", |b| {
@@ -1611,10 +1610,10 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
         format!("<|im_start|>system\n{}<|im_end|><|im_start|>user\nHow do I sort an array in Python?<|im_end|><|im_start|>assistant\nYou can use the sorted() function or list.sort() method.<|im_end|><|im_start|>user\nWhat's the difference between them?<|im_end|><|im_start|>assistant\nsorted() creates a new list, sort() modifies in place.<|im_end|><|im_start|>user\nCan I sort by a custom key?<|im_end|><|im_start|>assistant\n", conversation_system),
     ];
 
-    let conv_cached = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(
+    let conv_cached = Arc::new(CachedTokenizer::new(
         tokenizer.clone(),
         l0_l1_config.clone(),
-    )));
+    ));
 
     let printed_conv = Arc::new(AtomicBool::new(false));
     group.bench_function("multi_turn_conversation", |b| {
@@ -1688,7 +1687,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
         })
         .collect();
 
-    let review_cached = Arc::new(TokenizerBackend::Cached(CachedTokenizer::new(tokenizer.clone(), l0_l1_config)));
+    let review_cached = Arc::new(CachedTokenizer::new(tokenizer.clone(), l0_l1_config));
 
     let printed_review = Arc::new(AtomicBool::new(false));
     group.bench_function("code_review_assistant", |b| {

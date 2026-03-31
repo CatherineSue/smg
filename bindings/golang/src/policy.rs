@@ -16,7 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use llm_tokenizer::{create_tokenizer_from_file, traits::{Encoder as _, Tokenizer as _}, TokenizerBackend};
+use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     worker::{HealthCheckConfig, WorkerSpec},
@@ -480,7 +480,7 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
     let multi_client = &*client_handle;
 
     // Create tokenizer
-    let tokenizer: Arc<TokenizerBackend> =
+    let tokenizer: Arc<dyn Tokenizer> =
         match create_tokenizer_from_file(&multi_client.tokenizer_path) {
             Ok(t) => t,
             Err(e) => {

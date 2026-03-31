@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use llm_tokenizer::{traits::{Decoder as _, Tokenizer as _}, TokenizerBackend};
+use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
 
 use crate::routers::grpc::proto_wrapper::{ProtoInputLogProbs, ProtoOutputLogProbs};
@@ -60,7 +60,7 @@ pub(crate) fn convert_proto_logprobs(
 /// Convert OutputLogProbs to OpenAI ChatLogProbs format using a Tokenizer
 pub(crate) fn convert_proto_to_openai_logprobs(
     proto_logprobs: &ProtoOutputLogProbs,
-    tokenizer: &Arc<TokenizerBackend>,
+    tokenizer: &Arc<dyn Tokenizer>,
 ) -> ChatLogProbs {
     convert_proto_logprobs(proto_logprobs, |token_id| {
         tokenizer

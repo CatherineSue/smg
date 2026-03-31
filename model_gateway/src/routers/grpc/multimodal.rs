@@ -19,7 +19,7 @@ use llm_multimodal::{
     ModelSpecificValue, PlaceholderRange, PreProcessorConfig, PreprocessedImages,
     PromptReplacement, TrackedMedia, TrackerOutput,
 };
-use llm_tokenizer::{TokenizerTrait, TokenizerBackend};
+use llm_tokenizer::TokenizerTrait;
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
@@ -163,7 +163,7 @@ pub(crate) struct MultimodalIntermediate {
 /// is not recognized as multimodal.
 pub(crate) async fn resolve_placeholder_token(
     model_id: &str,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn TokenizerTrait,
     components: &MultimodalComponents,
     tokenizer_source: &str,
 ) -> Result<Option<String>> {
@@ -321,7 +321,7 @@ fn extract_content_parts_messages(messages: &[InputMessage]) -> Vec<MediaContent
 pub(crate) async fn process_multimodal_messages(
     messages: &[InputMessage],
     model_id: &str,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn TokenizerTrait,
     token_ids: Vec<u32>,
     components: &MultimodalComponents,
     tokenizer_source: &str,
@@ -345,7 +345,7 @@ pub(crate) async fn process_multimodal_messages(
 pub(crate) async fn process_multimodal(
     messages: &[ChatMessage],
     model_id: &str,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn TokenizerTrait,
     token_ids: Vec<u32>,
     components: &MultimodalComponents,
     tokenizer_source: &str,
@@ -369,7 +369,7 @@ pub(crate) async fn process_multimodal(
 async fn process_multimodal_parts(
     content_parts: Vec<MediaContentPart>,
     model_id: &str,
-    tokenizer: &TokenizerBackend,
+    tokenizer: &dyn TokenizerTrait,
     token_ids: Vec<u32>,
     components: &MultimodalComponents,
     tokenizer_source: &str,

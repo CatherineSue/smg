@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use llm_tokenizer::{stop::StopSequenceDecoder, TokenizerBackend, TokenizerRegistry};
+use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
@@ -104,7 +104,7 @@ pub(crate) struct ProcessingState {
 
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
-    pub tokenizer: Option<Arc<TokenizerBackend>>,
+    pub tokenizer: Option<Arc<dyn Tokenizer>>,
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
@@ -493,7 +493,7 @@ impl RequestContext {
     ///
     /// Returns None if tokenizer hasn't been resolved yet.
     /// The tokenizer is resolved once in the preparation stage and cached for reuse.
-    pub fn tokenizer_arc(&self) -> Option<Arc<TokenizerBackend>> {
+    pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.state.tokenizer.clone()
     }
 }
