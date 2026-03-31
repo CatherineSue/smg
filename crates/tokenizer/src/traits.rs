@@ -160,3 +160,58 @@ pub struct SpecialTokens {
     pub mask_token: Option<String>,
     pub additional_special_tokens: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the default `decode_step` implementation produces
+    /// identical concatenated output to a single `decode()` call.
+    #[test]
+    fn test_decode_step_matches_full_decode() {
+        use crate::mock::MockTokenizer;
+
+        let tokenizer = MockTokenizer::new();
+        let token_ids: Vec<TokenIdType> = vec![1, 2, 3, 4]; // Hello world test token
+
+        // Full decode (ground truth)
+        let full = tokenizer.decode(&token_ids, false).unwrap();
+
+        // Incremental decode_step
+        let mut ids = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let mut incremental = String::new();
+
+        for &tid in &token_ids {
+            if let Some(text) = tokenizer
+                .decode_step(tid, &mut ids, &mut prefix, &mut prefix_index, false)
+                .unwrap()
+            {
+                incremental.push_str(&text);
+            }
+        }
+
+        assert_eq!(
+            incremental, full,
+            "decode_step output differs from full decode"
+        );
+    }
+
+    /// Verify decode_step works correctly with a single token.
+    #[test]
+    fn test_decode_step_single_token() {
+        use crate::mock::MockTokenizer;
+
+        let tokenizer = MockTokenizer::new();
+        let mut ids = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+
+        let result = tokenizer
+            .decode_step(1, &mut ids, &mut prefix, &mut prefix_index, false)
+            .unwrap();
+
+        assert_eq!(result, Some("Hello".to_string()));
+    }
+}

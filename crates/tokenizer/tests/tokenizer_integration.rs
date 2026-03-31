@@ -575,3 +575,55 @@ async fn test_llava_separate_jinja_template() {
         }
     }
 }
+
+/// Verify that the native HF `decode_step` (via `step_decode_stream`) produces
+/// identical output to a full `decode()` for every test prompt.
+/// This catches any mismatch between the native incremental path and batch decode.
+#[test]
+fn test_native_decode_step_matches_full_decode() {
+    use llm_tokenizer::traits::Decoder;
+
+    let tokenizer_path = ensure_tokenizer_cached();
+    let tokenizer = Arc::new(
+        HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+            .expect("Failed to load tokenizer"),
+    );
+
+    let all_prompts: Vec<&str> = TEST_PROMPTS
+        .iter()
+        .copied()
+        .chain(LONG_TEST_PROMPTS.iter().map(|(_, output)| *output))
+        .collect();
+
+    for prompt in &all_prompts {
+        let encoding = tokenizer
+            .encode(prompt, false)
+            .expect("Failed to encode prompt");
+        let token_ids = encoding.token_ids();
+
+        // Path A: full decode (ground truth)
+        let full_decode = tokenizer
+            .decode(token_ids, false)
+            .expect("Full decode failed");
+
+        // Path B: incremental decode_step (native HF step_decode_stream)
+        let mut ids = Vec::new();
+        let mut prefix = String::new();
+        let mut prefix_index = 0usize;
+        let mut incremental_output = String::new();
+
+        for &token_id in token_ids {
+            if let Some(text) = tokenizer
+                .decode_step(token_id, &mut ids, &mut prefix, &mut prefix_index, false)
+                .expect("decode_step failed")
+            {
+                incremental_output.push_str(&text);
+            }
+        }
+
+        assert_eq!(
+            incremental_output, full_decode,
+            "decode_step output differs from full decode for prompt: {prompt:?}"
+        );
+    }
+}
