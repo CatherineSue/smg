@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    backend::TokenizerBackend,
     mock,
     traits::{Decoder, Encoder},
     Tokenizer,
@@ -36,8 +37,7 @@ fn test_mock_tokenizer_decode_skip_special() {
 
 #[test]
 fn test_tokenizer_wrapper() {
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     let encoding = tokenizer.encode("Hello world", false).unwrap();
     assert_eq!(encoding.token_ids(), &[1, 2]);
@@ -56,8 +56,7 @@ fn test_tokenizer_wrapper() {
 
 #[test]
 fn test_decode_stream_basic() {
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     // Create a decode stream with initial tokens [1, 2] = "Hello world"
     let initial_tokens = vec![1, 2];
@@ -77,8 +76,7 @@ fn test_decode_stream_basic() {
 
 #[test]
 fn test_decode_stream_multiple_steps() {
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     // Start with a single token [1] = "Hello"
     let initial_tokens = vec![1];
@@ -103,8 +101,7 @@ fn test_decode_stream_multiple_steps() {
 
 #[test]
 fn test_decode_stream_flush() {
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     let initial_tokens = vec![1]; // "Hello"
     let mut stream = tokenizer.decode_stream(&initial_tokens, false);
@@ -124,8 +121,7 @@ fn test_decode_stream_flush() {
 
 #[test]
 fn test_special_tokens() {
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     let special_tokens = tokenizer.get_special_tokens();
     assert_eq!(special_tokens.bos_token, Some("<bos>".to_string()));
@@ -151,8 +147,7 @@ fn test_batch_encode() {
 fn test_thread_safety() {
     use std::thread;
 
-    let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
-    let tokenizer = Tokenizer::from_arc(mock_tokenizer);
+    let tokenizer = Tokenizer::from_backend(Arc::new(TokenizerBackend::Mock(mock::MockTokenizer::new())));
 
     // Spawn multiple threads that use the same tokenizer
     let handles: Vec<_> = (0..10)

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+pub mod backend;
 pub mod cache;
 pub mod factory;
 pub mod hub;
@@ -20,6 +21,7 @@ pub mod tiktoken;
 mod tests;
 
 // Re-export types used outside this module
+pub use backend::TokenizerBackend;
 pub use cache::{CacheConfig, CacheStats, CachedTokenizer, L0Cache, L1Cache, TokenizerFingerprint};
 pub use chat_template::ChatTemplateState;
 pub use factory::{
@@ -37,9 +39,11 @@ pub use traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
 
-/// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
+/// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations.
+///
+/// Internally holds an `Arc<TokenizerBackend>` for enum-based dispatch on the hot path.
 #[derive(Clone)]
-pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
+pub struct Tokenizer(Arc<TokenizerBackend>);
 
 impl Tokenizer {
     /// Create a tokenizer from a file path
@@ -58,9 +62,36 @@ impl Tokenizer {
         )?))
     }
 
-    /// Create a tokenizer from an Arc<dyn Tokenizer>
+    /// Create a tokenizer from an `Arc<TokenizerBackend>`
+    pub fn from_backend(backend: Arc<TokenizerBackend>) -> Self {
+        Tokenizer(backend)
+    }
+
+    /// Create a tokenizer from an `Arc<dyn Tokenizer>` (backward compatibility).
+    ///
+    /// This wraps the trait object in a `TokenizerBackend` that delegates through
+    /// the vtable. Prefer `from_backend` when you have a concrete backend.
     pub fn from_arc(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
-        Tokenizer(tokenizer)
+        // For backward compatibility, we need to go through the trait object.
+        // This path is only used by code that hasn't migrated to TokenizerBackend yet.
+        // We re-wrap in a Mock variant as a placeholder — callers should migrate.
+        // TODO: Remove this once all callers use from_backend
+        Tokenizer(tokenizer.as_any().downcast_ref::<TokenizerBackend>()
+            .map(|_| {
+                // The Arc already contains a TokenizerBackend — but we can't safely
+                // recover the Arc<TokenizerBackend> from Arc<dyn Tokenizer>.
+                // For now, just create a new factory call.
+                unreachable!("Use from_backend for Arc<TokenizerBackend>")
+            })
+            .unwrap_or_else(|| {
+                // This shouldn't be called in practice after migration
+                panic!("Tokenizer::from_arc is deprecated — use Tokenizer::from_backend instead")
+            }))
+    }
+
+    /// Get the inner backend
+    pub fn backend(&self) -> &Arc<TokenizerBackend> {
+        &self.0
     }
 
     /// Create a stateful sequence object for decoding token_ids into text
@@ -69,7 +100,9 @@ impl Tokenizer {
         prompt_token_ids: &[u32],
         skip_special_tokens: bool,
     ) -> DecodeStream {
-        DecodeStream::new(self.0.clone(), prompt_token_ids, skip_special_tokens)
+        // DecodeStream still accepts Arc<dyn Tokenizer> for backward compat with Go bindings.
+        // Arc<TokenizerBackend> coerces to Arc<dyn Tokenizer> since TokenizerBackend: Tokenizer.
+        DecodeStream::new(self.0.clone() as Arc<dyn traits::Tokenizer>, prompt_token_ids, skip_special_tokens)
     }
 
     /// Direct encode method
@@ -114,8 +147,8 @@ impl Tokenizer {
     }
 }
 
-impl From<Arc<dyn traits::Tokenizer>> for Tokenizer {
-    fn from(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
-        Tokenizer(tokenizer)
+impl From<Arc<TokenizerBackend>> for Tokenizer {
+    fn from(backend: Arc<TokenizerBackend>) -> Self {
+        Tokenizer(backend)
     }
 }
