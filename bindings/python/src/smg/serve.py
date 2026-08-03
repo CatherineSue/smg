@@ -23,6 +23,55 @@ from smg.router_args import RouterArgs
 
 logger = logging.getLogger("smg.serve")
 
+# Directory for the per-worker ipc:// sockets when connection_mode == "zmq".
+# SMG derives its data-plane socket paths and the tcp handshake port from the
+# ipc:// worker URL, so the engine and the router only need to agree on this URL.
+# Per-user directory for the ZMQ ipc:// sockets. Scoped to the current uid and
+# created 0700 (single-owner) so a shared /tmp cannot leak another user's
+# sockets into this router. Override with SMG_ZMQ_SOCKET_DIR.
+_ZMQ_SOCKET_DIR = os.environ.get("SMG_ZMQ_SOCKET_DIR", f"/tmp/smg-zmq-{os.getuid()}")
+
+
+def _zmq_ipc_url(port: int) -> str:
+    """Per-worker ipc:// URL. The port keeps it unique across DP-free workers."""
+    return f"ipc://{_ZMQ_SOCKET_DIR}/engine-{port}"
+
+
+def _zmq_handshake_port(ipc_url: str) -> int:
+    """The tcp handshake port SMG derives from an ipc:// URL.
+
+    Mirrors `derive_handshake_port` in model_gateway/src/worker/worker.rs exactly
+    (FNV-1a over the path after `ipc://`, mapped into 20000..=29999) so the engine
+    can be launched with the matching `--data-parallel-rpc-port`.
+    """
+    path = ipc_url[len("ipc://") :] if ipc_url.startswith("ipc://") else ipc_url
+    h = 0xCBF29CE484222325
+    for b in path.encode():
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return 20000 + (h % 10000)
+
+
+def _reject_handshake_port_collisions(ports: list[int]) -> None:
+    """Fail before launch if two workers derive the same ZMQ handshake port.
+
+    The handshake port is an FNV-1a hash of the ipc:// path folded into a
+    10000-wide band, so distinct workers can collide. Two engines dialing the
+    same tcp port would cross their handshakes, so reject it up front with a
+    message naming the colliding URLs instead of failing opaquely at bind time.
+    """
+    seen: dict[int, str] = {}
+    for port in ports:
+        ipc_url = _zmq_ipc_url(port)
+        handshake_port = _zmq_handshake_port(ipc_url)
+        if handshake_port in seen:
+            raise ValueError(
+                f"ZMQ handshake port collision on {handshake_port}: "
+                f"{seen[handshake_port]} and {ipc_url} derive the same port. "
+                "Adjust --worker-base-port so the worker ipc paths differ."
+            )
+        seen[handshake_port] = ipc_url
+
 
 # ---------------------------------------------------------------------------
 # WorkerLauncher ABC + backend implementations
@@ -41,14 +90,23 @@ class WorkerLauncher(ABC):
 
     def health_check(self, args: argparse.Namespace, host: str, port: int, timeout: float) -> bool:
         """Return True when the worker at host:port is healthy."""
-        if getattr(args, "connection_mode", "grpc") == "grpc":
+        mode = getattr(args, "connection_mode", "grpc")
+        if mode == "grpc":
             return _grpc_health_check(host, port, timeout)
+        if mode == "zmq":
+            # SMG binds the ZMQ sockets and the engine dials in; there is no
+            # host:port to probe. The router's own health checker gates
+            # readiness, so the launcher just proceeds to start the router.
+            return True
         return _http_health_check(f"http://{host}:{port}/health", timeout)
 
     def worker_url(self, args: argparse.Namespace, host: str, port: int) -> str:
         """Return the URL used by the router to reach this worker."""
-        if getattr(args, "connection_mode", "grpc") == "grpc":
+        mode = getattr(args, "connection_mode", "grpc")
+        if mode == "grpc":
             return f"grpc://{host}:{port}"
+        if mode == "zmq":
+            return _zmq_ipc_url(port)
         return f"http://{host}:{port}"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
@@ -90,18 +148,23 @@ class WorkerLauncher(ABC):
     def _filter_backend_args(self, backend_args: list[str], filter_args: list[str]) -> list[str]:
         """Filter out args from backend_args that are already set by the launcher.
 
-        Handles both ``--key value`` and ``--key=value`` syntax.
+        Handles ``--key=value``, ``--key value``, and boolean flags. A filtered
+        key in ``--key value`` form only consumes the following token when it
+        actually looks like a value (not another ``-``-prefixed flag), so a
+        filtered boolean flag does not swallow the argument after it.
         """
         filtered = []
         skip_next = False
-        for arg in backend_args:
+        for i, arg in enumerate(backend_args):
             if skip_next:
                 skip_next = False
                 continue
             key = arg.split("=", 1)[0]
             if key in filter_args:
                 if "=" not in arg:
-                    skip_next = True  # value is the next token
+                    nxt = backend_args[i + 1] if i + 1 < len(backend_args) else None
+                    if nxt is not None and not nxt.startswith("-"):
+                        skip_next = True  # value is the next token
                 continue
             filtered.append(arg)
         return filtered
@@ -163,6 +226,9 @@ class VllmWorkerLauncher(WorkerLauncher):
     def build_command(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int
     ) -> list[str]:
+        if getattr(args, "connection_mode", "grpc") == "zmq":
+            return self._build_zmq_command(args, backend_args, port)
+
         vllm_entry_points = (
             "vllm.entrypoints.grpc_server"
             if args.connection_mode == "grpc"
@@ -189,6 +255,48 @@ class VllmWorkerLauncher(WorkerLauncher):
             self._filter_backend_args(backend_args, ["--model", "--host", "--port", "--uds"])
         )
 
+        return cmd
+
+    def _build_zmq_command(
+        self, args: argparse.Namespace, backend_args: list[str], port: int
+    ) -> list[str]:
+        """Launch a headless vLLM EngineCore that dials SMG's ZMQ handshake.
+
+        SMG (the router) binds the tcp handshake + ipc data-plane sockets it
+        derives from the ipc:// worker URL; this engine connects in. Each worker
+        is a standalone engine (`--data-parallel-size 1`); running several is
+        dense data parallelism as N independent ZMQ workers.
+        """
+        rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            getattr(args, "model", ""),
+            "--headless",
+            "--data-parallel-size",
+            "1",
+            "--data-parallel-size-local",
+            "1",
+            "--data-parallel-address",
+            "127.0.0.1",
+            "--data-parallel-rpc-port",
+            str(rpc_port),
+        ]
+        cmd.extend(
+            self._filter_backend_args(
+                backend_args,
+                [
+                    "--model",
+                    "--headless",
+                    "--data-parallel-size",
+                    "--data-parallel-size-local",
+                    "--data-parallel-address",
+                    "--data-parallel-rpc-port",
+                ],
+            )
+        )
         return cmd
 
 
@@ -462,8 +570,11 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--connection-mode",
         default="grpc",
-        choices=["grpc", "http"],
-        help="Connection mode for workers (default: grpc). Note: trtllm only support grpc",
+        choices=["grpc", "http", "zmq"],
+        help=(
+            "Connection mode for workers (default: grpc). Note: trtllm only "
+            "supports grpc, and zmq is only supported for the vllm backend"
+        ),
     )
     # Router host/port - may be overridden by backend (e.g. sglang)
     group.add_argument(
@@ -541,6 +652,13 @@ def parse_serve_args(
     serve_router_args, backend_args = pre_parser.parse_known_args(argv)
     backend = serve_router_args.backend
 
+    # ZMQ direct-backend is a same-host vLLM EngineCore connection; no other
+    # backend speaks the EngineCore ZMQ protocol.
+    if serve_router_args.connection_mode == "zmq" and backend != "vllm":
+        pre_parser.error(
+            f"connection-mode zmq is only supported for the vllm backend, not {backend}"
+        )
+
     # Pass 2: full parser with backend-specific args; resolve so backend can override
     parser = argparse.ArgumentParser(
         description=f"Launch {backend} worker(s) + gateway router",
@@ -598,6 +716,8 @@ class ServeOrchestrator:
 
     def _launch_workers(self) -> None:
         ports = _find_available_ports(self.args.worker_base_port, self.args.data_parallel_size)
+        if getattr(self.args, "connection_mode", "grpc") == "zmq":
+            _reject_handshake_port_collisions(ports)
         host = self.args.worker_host
         for dp_rank, port in enumerate(ports):
             env = self.launcher.gpu_env(self.args, dp_rank)

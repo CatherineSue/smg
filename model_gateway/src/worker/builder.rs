@@ -160,7 +160,7 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set gRPC client for gRPC workers
+    /// Set the backend client (gRPC or ZMQ) for a local worker.
     pub fn backend_client(mut self, client: BackendClient) -> Self {
         self.backend_client = Some(client);
         self
@@ -233,7 +233,7 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(mut self) -> BasicWorker {
-        use std::sync::Arc;
+        use std::sync::{atomic::AtomicBool, Arc};
 
         use tokio::sync::OnceCell;
 
@@ -258,16 +258,16 @@ impl BasicWorkerBuilder {
             health_endpoint: self.health_endpoint,
         };
 
-        // Use OnceCell for lock-free gRPC client access after initialization
-        let backend_client = Arc::new(match self.backend_client {
-            Some(client) => {
-                let cell = OnceCell::new();
-                // Pre-set the client if provided (blocking set is fine during construction)
+        // OnceCell for lock-free client access after initialization; ArcSwap so
+        // the ZMQ health probe can evict a dead client (see BasicWorker docs).
+        let backend_client = {
+            let cell = OnceCell::new();
+            if let Some(client) = self.backend_client {
+                // Pre-set the client if provided (set on a fresh cell cannot fail)
                 cell.set(Arc::new(client)).ok();
-                cell
             }
-            None => OnceCell::new(),
-        });
+            Arc::new(ArcSwap::from_pointee(cell))
+        };
 
         // Caller can override the initial status (e.g. when replacing an
         // existing worker, to preserve its prior status). Otherwise:
@@ -303,6 +303,7 @@ impl BasicWorkerBuilder {
             )),
             metadata,
             backend_client,
+            zmq_connect_started: Arc::new(AtomicBool::new(false)),
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,
