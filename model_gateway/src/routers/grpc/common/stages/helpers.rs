@@ -452,7 +452,13 @@ fn inject_sglang_bootstrap_metadata(
         bootstrap_room: room_id,
     };
 
-    let sglang_request = request.as_sglang_mut();
+    // Guarded by the caller's runtime check, but match defensively: a non-SGLang
+    // proto here (e.g. a ZMQ backend reporting an unexpected runtime) must not
+    // take down the request task via the panicking accessor.
+    let ProtoGenerateRequest::Sglang(sglang_request) = request else {
+        warn!("PD bootstrap metadata requested for a non-SGLang request; skipping injection");
+        return;
+    };
     sglang_request.disaggregated_params = Some(disagg_params);
 
     debug!(
@@ -766,6 +772,39 @@ mod stop_resolution_tests {
             vec![6],
             "only the single-token stop, no EOS fold"
         );
+    }
+
+    #[test]
+    fn pd_bootstrap_injection_skips_non_sglang_requests() {
+        use super::{RuntimeType, Worker, WorkerSelection};
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        // An SGLang-runtime worker selection paired with a non-SGLang proto
+        // (e.g. a misreporting backend) must skip injection, not panic.
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker.clone(),
+            decode: worker,
+            runtime_type: RuntimeType::Sglang,
+        };
+
+        let mut req = vllm_request(vec!["."], vec![7]);
+        let before = match &req {
+            ProtoGenerateRequest::Vllm(inner) => (**inner).clone(),
+            _ => panic!("vllm_request builds a Vllm variant"),
+        };
+        super::maybe_inject_pd_metadata(&mut req, &selection);
+        match &req {
+            ProtoGenerateRequest::Vllm(inner) => {
+                assert_eq!(**inner, before, "request must be untouched");
+            }
+            _ => panic!("variant must be unchanged"),
+        }
     }
 
     #[test]
