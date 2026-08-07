@@ -364,43 +364,36 @@ fn encode_single_token_stops(
 /// any single-token stop as a `stop_token_ids` entry for early stopping; the
 /// router-side decoder handles the rest. This is the single resolution point
 /// shared by SGLang gRPC and every ZMQ backend.
+///
+/// Returns the stop strings that were stripped — the router's residual
+/// obligation: the engine will never match these, so response processing must
+/// trim them from the output text. Empty when the engine matches server-side.
 pub(crate) fn resolve_string_stops(
     request: &mut ProtoGenerateRequest,
     tokenizer: Option<&Arc<dyn Tokenizer>>,
-    is_zmq: bool,
-) {
+    token_only_wire: bool,
+) -> Vec<String> {
     // SGLang always needs it; the vLLM and TokenSpeed protos only when talking
-    // to a ZMQ backend (which is the sole path either reaches token-only).
+    // to a token-only wire (direct-ZMQ, the sole path either reaches that way).
     match request {
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
-        ProtoGenerateRequest::Vllm(req) if is_zmq => {
+        ProtoGenerateRequest::Vllm(req) if token_only_wire => {
+            // EOS injection for the tokenizer-less EngineCore is the ZMQ
+            // client's own policy (zmq_client::fold_tokenizer_eos_backstop),
+            // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
-                // The engine only stops at EOS when the frontend supplies the
-                // ids, and the connect-time model-dir resolution has nothing
-                // to read when the worker's model id is a repo id rather than
-                // a local path. The tokenizer carries the merged EOS set, so
-                // fold it into the stop tokens as the always-available
-                // backstop — without it an uncapped request generates to the
-                // full context window.
-                if !params.ignore_eos {
-                    if let Some(tokenizer) = tokenizer {
-                        for &id in tokenizer.eos_token_ids() {
-                            if !params.stop_token_ids.contains(&id) {
-                                params.stop_token_ids.push(id);
-                            }
-                        }
-                    }
-                }
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
-        ProtoGenerateRequest::TokenSpeed(req) if is_zmq => {
+        ProtoGenerateRequest::TokenSpeed(req) if token_only_wire => {
             // TokenSpeed over ZMQ receives token ids only, so its wire
             // translation drops raw `stop` strings; without this a single-token
             // user stop would never reach the engine as a `stop_token_ids`
@@ -409,11 +402,13 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
         _ => {}
     }
+    Vec::new()
 }
 
 /// Inject PD bootstrap metadata for SGLang if needed.
@@ -698,39 +693,14 @@ mod stop_resolution_tests {
         );
         assert!(params.stop_token_ids.is_empty());
 
-        // ZMQ vLLM (EngineCore sees token ids only) resolves like SGLang, and
-        // gains the tokenizer's EOS ids so generation always terminates.
+        // ZMQ vLLM (EngineCore sees token ids only) resolves like SGLang.
+        // EOS injection is the ZMQ client's own step, not stop resolution's
+        // (see zmq_client::fold_tokenizer_eos_backstop tests).
         let mut zmq = vllm_request(vec!["."], vec![]);
         resolve_string_stops(&mut zmq, Some(&mock_tokenizer()), true);
         let params = vllm_params(&zmq);
         assert!(params.stop.is_empty(), "ZMQ vLLM stop cleared");
-        assert_eq!(params.stop_token_ids, vec![6, 999]);
-    }
-
-    #[test]
-    fn vllm_zmq_appends_tokenizer_eos_ids() {
-        let mut req = vllm_request(vec![], vec![7]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![7, 999]);
-
-        // Already-present EOS ids are not duplicated.
-        let mut req = vllm_request(vec![], vec![999]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![999]);
-    }
-
-    #[test]
-    fn vllm_zmq_ignore_eos_skips_injection() {
-        let mut req = ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
-            sampling_params: Some(vllm_proto::SamplingParams {
-                stop_token_ids: vec![7],
-                ignore_eos: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![7]);
+        assert_eq!(params.stop_token_ids, vec![6]);
     }
 
     #[test]
@@ -772,6 +742,21 @@ mod stop_resolution_tests {
             vec![6],
             "only the single-token stop, no EOS fold"
         );
+    }
+
+    #[test]
+    fn resolution_returns_router_obligations() {
+        // Strings stripped for the engine come back as the router's trim duty.
+        let mut req = sglang_request(vec![".", "Hello world"], vec![]);
+        let obligations = resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
+        assert_eq!(
+            obligations,
+            vec![".".to_string(), "Hello world".to_string()]
+        );
+
+        // gRPC vLLM matches stops server-side: nothing left for the router.
+        let mut req = vllm_request(vec!["."], vec![]);
+        assert!(resolve_string_stops(&mut req, Some(&mock_tokenizer()), false).is_empty());
     }
 
     #[test]

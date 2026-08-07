@@ -396,7 +396,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 };
                 ProtoGenerateRequest::TokenSpeed(Box::new(req))
             }
-            BackendClient::Zmq(_) => {
+            BackendClient::Zmq(zmq_client) if zmq_client.runtime() == RuntimeType::Vllm => {
                 let req = match &ctx.input.request_type {
                     RequestType::Chat(request) => {
                         let body = modified_request
@@ -442,6 +442,17 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     }
                 };
                 ProtoGenerateRequest::Vllm(Box::new(req))
+            }
+            // connect() admits only vLLM/TokenSpeed runtimes over ZMQ; a client
+            // reporting anything else is a wiring bug, not a request to serve.
+            BackendClient::Zmq(zmq_client) => {
+                return Err(error::internal_error(
+                    "unsupported_zmq_runtime",
+                    format!(
+                        "ZMQ backend reports unsupported runtime {:?} for Harmony requests",
+                        zmq_client.runtime()
+                    ),
+                ));
             }
         };
 
@@ -499,6 +510,12 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 }
             }
         }
+
+        // The client resolves string `stop`s its engine can't match and
+        // reports the router's residual trim obligation; harmony response
+        // processing scans channel text for exactly these strings.
+        ctx.state.response.router_stop_obligations = builder_client
+            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
 
         if self.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
