@@ -858,8 +858,52 @@ class TestTokenspeedWorkerLauncher:
         assert str(expected_port) in cmd
         assert "--zmq-engine-index" in cmd
         assert "0" in cmd
+        # The launcher owns the engine's control-plane port layout: --port
+        # seeds the derived cluster per worker, --dist-init-addr pins the
+        # torch.distributed store at TokenSpeed's own dp==1 derivation
+        # (port + 233) so dp==1 and dp>1 share one layout.
+        assert cmd[cmd.index("--port") + 1] == "31000"
+        assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:31233"
         for arg in backend_args:
             assert arg in cmd
+
+    def test_build_zmq_command_passes_dp_size_through(self):
+        # DP is the engine's flag: the launcher forwards it untouched and the
+        # ranks each dial the shared socket set with their own identity.
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--data-parallel-size", "2"], "127.0.0.1", 31000)
+
+        assert cmd[cmd.index("--data-parallel-size") + 1] == "2"
+        # dp>1 hard-requires the explicit store address the launcher always passes.
+        assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:31233"
+
+    def test_build_zmq_command_reflects_dist_port_below_u16_ceiling(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, [], "127.0.0.1", 65500)
+
+        assert cmd[cmd.index("--dist-init-addr") + 1] == f"127.0.0.1:{65500 - 233}"
+
+    def test_dist_port_never_enters_the_handshake_band(self):
+        # The handshake port is a hash of the ipc path folded into
+        # 20000..=29999, so a dist port inside that band can land on some
+        # worker's rpc listener — which port collides depends on the socket
+        # dir (uid). The launcher must keep the dist port out of the band
+        # entirely; that also implies it never equals this worker's own
+        # rpc port. Sweep every worker port whose naive +233 derivation
+        # lands in the band, plus the band edges and the u16 reflection.
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="zmq")
+        ports = [*range(19767, 29767), 19766, 29767, 31000, 65500]
+        for port in ports:
+            cmd = launcher.build_command(args, [], "127.0.0.1", port)
+            dist_port = int(cmd[cmd.index("--dist-init-addr") + 1].rsplit(":", 1)[1])
+            rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+            assert not 20000 <= dist_port <= 29999, (port, dist_port)
+            assert dist_port != rpc_port, (port, dist_port)
+            assert dist_port != port, (port, dist_port)
+            assert 1 <= dist_port <= 65535, (port, dist_port)
 
     def test_build_zmq_command_filters_launcher_owned_flags(self):
         launcher = TokenspeedWorkerLauncher()
