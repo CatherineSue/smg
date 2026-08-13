@@ -204,6 +204,8 @@ class RouterArgs:
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     worker_startup_delay: int = 0
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -1010,6 +1012,16 @@ class RouterArgs:
             help=(
                 "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
                 "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-engine-count",
+            type=int,
+            default=RouterArgs.zmq_engine_count,
+            help=(
+                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
+                "grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM only; default: 1)"
             ),
         )
         backend_group.add_argument(

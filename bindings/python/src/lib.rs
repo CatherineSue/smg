@@ -495,6 +495,10 @@ struct Router {
     model_aliases: HashMap<String, String>,
     worker_startup_delay: u64,
     worker_ports_annotation: String,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    /// Appended last: positional constructor compatibility (see the field
+    /// ordering rule on this struct's signature).
+    zmq_engine_count: Option<usize>,
 }
 
 impl Router {
@@ -769,6 +773,7 @@ impl Router {
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -989,6 +994,7 @@ impl Router {
         model_aliases = HashMap::new(),
         worker_startup_delay = 0,
         worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        zmq_engine_count = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1118,6 +1124,7 @@ impl Router {
         model_aliases: HashMap<String, String>,
         worker_startup_delay: u64,
         worker_ports_annotation: String,
+        zmq_engine_count: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1261,6 +1268,7 @@ impl Router {
             model_aliases,
             worker_startup_delay,
             worker_ports_annotation,
+            zmq_engine_count,
         })
     }
 
