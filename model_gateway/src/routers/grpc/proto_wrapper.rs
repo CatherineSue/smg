@@ -1278,12 +1278,30 @@ impl ProtoGenerateRequest {
 
     /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
-    /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,
-    /// but prefill still needs placeholders/model-specific metadata to slot them.
+    /// Used by the EPD prefill leg (multimodal embeddings arrive from encode
+    /// workers, but prefill still needs placeholders/model-specific metadata to
+    /// slot them) and by the PD decode leg (KV arrives via the P/D transfer).
+    ///
+    /// For vLLM the per-image identity (`mm_hashes` + placeholders) survives:
+    /// downstream it becomes the engine `cache_salt`, keeping decode-side
+    /// prefix-cache block hashes per-image. Without it two different images
+    /// behind the same text prefix expand to identical placeholder token runs
+    /// and alias in the decode worker's prefix cache — the later request is
+    /// answered from the earlier request's image KV.
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
-            Self::Vllm(req) => req.mm_inputs = None,
+            Self::Vllm(req) => match req.mm_inputs.as_mut() {
+                Some(mm) if !mm.mm_hashes.is_empty() => {
+                    mm.pixel_values = None;
+                    mm.model_specific_tensors.clear();
+                    // Layout keys describe the dropped tensors.
+                    mm.batched_keys.clear();
+                    mm.flat_keys.clear();
+                    mm.keep_on_cpu_keys.clear();
+                }
+                _ => req.mm_inputs = None,
+            },
             Self::TokenSpeed(req) => {
                 if let Some(mm) = req.mm_inputs.as_mut() {
                     for item in &mut mm.items {
@@ -2137,6 +2155,75 @@ mod tests {
     use prost::Message;
 
     use super::*;
+
+    fn vllm_mm_request(mm_inputs: vllm::MultimodalInputs) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(mm_inputs),
+            ..Default::default()
+        }))
+    }
+
+    fn vllm_inline_tensor() -> vllm::TensorData {
+        vllm::TensorData {
+            shape: vec![1, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 16])),
+        }
+    }
+
+    #[test]
+    fn vllm_clear_mm_pixel_values_keeps_identity() {
+        // PD decode leg: the tensors go, the per-image identity stays — it
+        // becomes the engine cache_salt downstream so decode-side block
+        // hashes stay per-image.
+        let mut req = vllm_mm_request(vllm::MultimodalInputs {
+            pixel_values: Some(vllm_inline_tensor()),
+            model_specific_tensors: HashMap::from([(
+                "image_grid_thw".to_string(),
+                vllm_inline_tensor(),
+            )]),
+            im_token_id: Some(151655),
+            mm_placeholders: vec![vllm::PlaceholderRange {
+                offset: 3,
+                length: 4,
+            }],
+            mm_hashes: vec!["h1".to_string()],
+            batched_keys: vec!["pixel_values".to_string()],
+            ..Default::default()
+        });
+
+        req.clear_mm_pixel_values();
+
+        let ProtoGenerateRequest::Vllm(req) = req else {
+            panic!("variant changed");
+        };
+        let mm = req.mm_inputs.expect("identity metadata must survive");
+        assert!(mm.pixel_values.is_none());
+        assert!(mm.model_specific_tensors.is_empty());
+        assert!(mm.batched_keys.is_empty());
+        assert!(mm.flat_keys.is_empty());
+        assert!(mm.keep_on_cpu_keys.is_empty());
+        assert_eq!(mm.mm_hashes, vec!["h1".to_string()]);
+        assert_eq!(mm.mm_placeholders.len(), 1);
+        assert_eq!(mm.im_token_id, Some(151655));
+    }
+
+    #[test]
+    fn vllm_clear_mm_pixel_values_drops_hashless_payload() {
+        // Without hashes there is no identity worth keeping; the whole
+        // payload is dropped as before.
+        let mut req = vllm_mm_request(vllm::MultimodalInputs {
+            pixel_values: Some(vllm_inline_tensor()),
+            ..Default::default()
+        });
+
+        req.clear_mm_pixel_values();
+
+        let ProtoGenerateRequest::Vllm(req) = req else {
+            panic!("variant changed");
+        };
+        assert!(req.mm_inputs.is_none());
+    }
 
     #[test]
     fn tokenspeed_image_into_proto_uses_itemized_payload() {

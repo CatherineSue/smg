@@ -1287,18 +1287,25 @@ fn translate_request(
         }
     };
     // Per-item mm features: the split the Python servicer performs before the
-    // engine happens here instead (the ZMQ path bypasses it).
-    let mm_features = req
-        .mm_inputs
-        .map(|mm| {
-            zmq_multimodal::build_mm_features(
-                mm,
-                prompt_token_ids.as_deref().unwrap_or(&[]),
-                model_dtype,
-            )
-        })
-        .transpose()?
-        .filter(|features| !features.is_empty());
+    // engine happens here instead (the ZMQ path bypasses it). A tensor-less
+    // mm payload is the PD decode leg's identity-only form: there are no
+    // features to build, but the per-image hashes must still reach the block
+    // hasher — they ride `cache_salt`, otherwise two different images behind
+    // the same text prefix alias in the decode worker's prefix cache.
+    let mut cache_salt = None;
+    let mm_features = match req.mm_inputs {
+        Some(mm) if mm.pixel_values.is_none() && mm.model_specific_tensors.is_empty() => {
+            cache_salt = zmq_multimodal::mm_identity_cache_salt(&mm.mm_hashes);
+            None
+        }
+        Some(mm) => zmq_multimodal::build_mm_features(
+            mm,
+            prompt_token_ids.as_deref().unwrap_or(&[]),
+            model_dtype,
+        )
+        .map(|features| (!features.is_empty()).then_some(features))?,
+        None => None,
+    };
     let data_parallel_rank = req
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
@@ -1316,6 +1323,7 @@ fn translate_request(
             .sampling_params
             .map(|sp| translate_sampling(sp, default_max_tokens, eos)),
         arrival_time: now_secs(),
+        cache_salt,
         data_parallel_rank,
         ..EngineCoreRequest::default()
     })
@@ -2435,6 +2443,44 @@ mod tests {
             request.sampling_params.as_ref().unwrap().prompt_logprobs,
             Some(2)
         );
+    }
+
+    #[test]
+    fn vllm_identity_only_mm_rides_cache_salt() {
+        // PD decode leg: tensors were stripped upstream but the per-image
+        // hashes survive; they must reach the engine as cache_salt so
+        // decode-side block hashes stay per-image (no mm_features exist to
+        // carry them).
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.mm_inputs = Some(vllm::MultimodalInputs {
+            mm_hashes: vec!["h1".to_string(), "h2".to_string()],
+            mm_placeholders: vec![
+                vllm::PlaceholderRange {
+                    offset: 0,
+                    length: 1,
+                },
+                vllm::PlaceholderRange {
+                    offset: 2,
+                    length: 1,
+                },
+            ],
+            im_token_id: Some(151655),
+            ..Default::default()
+        });
+        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated");
+        assert!(request.mm_features.is_none());
+        assert_eq!(request.cache_salt.as_deref(), Some("mm:h1,h2"));
+    }
+
+    #[test]
+    fn vllm_empty_mm_payload_stays_unsalted() {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.mm_inputs = Some(vllm::MultimodalInputs::default());
+        let request = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated");
+        assert!(request.mm_features.is_none());
+        assert_eq!(request.cache_salt, None);
     }
 
     #[test]

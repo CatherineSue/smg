@@ -154,6 +154,25 @@ fn mm_key(key: &str, is_video: bool) -> String {
     }
 }
 
+/// Fold per-image content hashes into a deterministic engine `cache_salt`.
+///
+/// Used for legs whose multimodal tensors were stripped upstream (the PD
+/// decode leg): `mm_features` cannot be built without the tensors, and vLLM
+/// folds multimodal identity into prefix-cache block hashes only through
+/// `mm_features` — so the identity rides `cache_salt`, which enters the
+/// chained block hash at block 0. Deterministic per image content, so reuse
+/// of the same image still hits the decode-side prefix cache while different
+/// images behind the same text prefix no longer alias.
+///
+/// Must stay in sync with `mm_identity_cache_salt` in
+/// `grpc_servicer/smg_grpc_servicer/vllm/mm_salt.py` (the gRPC path).
+pub(crate) fn mm_identity_cache_salt(mm_hashes: &[String]) -> Option<String> {
+    if mm_hashes.is_empty() {
+        return None;
+    }
+    Some(format!("mm:{}", mm_hashes.join(",")))
+}
+
 /// Build per-item `mm_features` from batched proto multimodal inputs.
 pub(crate) fn build_mm_features(
     mm: vllm::MultimodalInputs,
@@ -372,6 +391,17 @@ fn is_embed_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_cache_salt_is_deterministic_and_order_sensitive() {
+        assert_eq!(mm_identity_cache_salt(&[]), None);
+        let salt = mm_identity_cache_salt(&["h1".to_string(), "h2".to_string()]);
+        assert_eq!(salt.as_deref(), Some("mm:h1,h2"));
+        // Same images in a different order occupy different placeholder
+        // positions, so the salt must differ too.
+        let swapped = mm_identity_cache_salt(&["h2".to_string(), "h1".to_string()]);
+        assert_ne!(salt, swapped);
+    }
 
     fn inline_tensor(shape: Vec<u32>, dtype: &str, data: Vec<u8>) -> vllm::TensorData {
         vllm::TensorData {
