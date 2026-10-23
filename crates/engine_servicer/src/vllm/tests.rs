@@ -434,6 +434,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert_eq!(held.message, "Warming up");
     let (admitted, _cancel) = server
         .state
+        .shared
         .registry
         .register("held-probe")
         .expect("admission stays open while readiness is held");
@@ -457,7 +458,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert!(!draining.healthy);
     assert_eq!(draining.message, "Draining");
     assert!(
-        server.state.registry.register("late").is_err(),
+        server.state.shared.registry.register("late").is_err(),
         "the drain closes admission"
     );
 
@@ -1426,14 +1427,14 @@ async fn the_launchers_stats_flag_classifies_the_wire_before_its_first_batch() {
     model.log_stats = Some(true);
     let h = harness(model, None).await;
     assert_eq!(
-        h.server.state.engine.reports_steps(),
+        h.server.state.shared.engine.reports_steps(),
         Some(true),
         "step-reporting from the start, no batch seen"
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let untold = harness(model_info(), None).await;
     assert_eq!(
-        untold.server.state.engine.reports_steps(),
+        untold.server.state.shared.engine.reports_steps(),
         Some(false),
         "told nothing: classified by the first stats-only step batch"
     );
@@ -1490,6 +1491,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -1567,7 +1569,7 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .await
             .unwrap();
         wait_until(|| {
-            h.server.state.engine().is_ok_and(|client| {
+            h.server.state.shared.engine().is_ok_and(|client| {
                 client
                     .get_loads()
                     .loads
@@ -1653,6 +1655,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     wait_until(|| {
         h.server
             .state
+            .shared
             .engine()
             .is_ok_and(|client| client.get_loads().loads.len() == 2)
     })
@@ -1895,6 +1898,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -3823,7 +3827,12 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     assert_eq!(done.output_ids, vec![10]);
     // The shutdown lands between the completion and the poll that ends the
     // stream: `cancel_all` is what `stop()` fires first.
-    h.server.state.registry.cancel_all().expect("cancel_all");
+    h.server
+        .state
+        .shared
+        .registry
+        .cancel_all()
+        .expect("cancel_all");
     assert!(
         stream.next().bounded().await.is_none(),
         "a clean end after the completion, not a status"
@@ -4360,7 +4369,7 @@ async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
         .unwrap();
     chunk_tokens(c1.message().bounded().await.unwrap().unwrap());
     h.server.set_serving(false);
-    h.server.state.registry.cancel_all().unwrap();
+    h.server.state.shared.registry.cancel_all().unwrap();
     let cut = c1.message().bounded().await.expect_err("a cut is a status");
     assert_eq!(cut.code(), Code::Unavailable);
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["c1".to_string()]);
