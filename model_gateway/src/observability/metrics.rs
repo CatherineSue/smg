@@ -55,7 +55,7 @@ pub(crate) fn interner_size() -> usize {
 
 /// Per-worker caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's and the per-worker
-/// request counter's. The helpers, the installed flag and the router's
+/// request counters' and gauges'. The helpers, the installed flag and the router's
 /// request and duration caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
 /// same way.
@@ -109,40 +109,64 @@ mod handles {
     }
 
     /// Every registration or removal of a worker moves this on, and a
-    /// thread whose kept worker counters are from an earlier state drops
+    /// thread whose kept per-worker handles are from an earlier state drops
     /// them at its next record: a removal drops the address's series from
     /// the per-worker store, so a handle kept from before feeds nothing,
     /// and a handle built while the address was retired is a no-op one,
     /// which a re-registration would otherwise leave in place.
     static WORKER_SET_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-    /// A worker registered or was removed: the kept worker counters are
+    /// A worker registered or was removed: the kept per-worker handles are
     /// stale.
     pub(super) fn worker_set_changed() {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// This thread's kept `smg_worker_requests_total` handles, by worker
-    /// URL then the model label as the interner gave it, with the
-    /// worker-set generation they were kept under.
-    #[derive(Default)]
-    pub(super) struct WorkerRequests {
+    /// This thread's kept handles of one per-worker family, by worker URL,
+    /// with the worker-set generation they were kept under. The rule for
+    /// every family is here: the map is cleared when the generation moves.
+    pub(super) struct ByWorker<V> {
         generation: u64,
-        by_worker: HashMap<String, HashMap<Arc<str>, Counter>>,
+        by_worker: HashMap<String, V>,
     }
 
-    impl WorkerRequests {
-        /// The handles by model for `worker_url`, after dropping every kept
-        /// handle if the worker set changed since they were kept.
-        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
+    impl<V> Default for ByWorker<V> {
+        fn default() -> Self {
+            Self {
+                generation: 0,
+                by_worker: HashMap::new(),
+            }
+        }
+    }
+
+    impl<V> ByWorker<V> {
+        /// The handles by worker, after dropping every kept handle if the
+        /// worker set changed since they were kept.
+        pub(super) fn current(&mut self) -> &mut HashMap<String, V> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             if self.generation != generation {
                 self.by_worker.clear();
                 self.generation = generation;
             }
-            nested(&mut self.by_worker, worker_url)
+            &mut self.by_worker
         }
     }
+
+    /// `smg_worker_requests_total`: by worker URL, then the model label as
+    /// the interner gave it.
+    pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
+
+    impl WorkerRequests {
+        /// The handles by model for `worker_url`.
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
+            nested(self.current(), worker_url)
+        }
+    }
+
+    /// A per-worker gauge set on every request (the active-request count,
+    /// the circuit breaker's consecutive outcomes): set through its kept
+    /// handle, not through a key built and looked up per call.
+    pub(super) type WorkerGauges = ByWorker<Gauge>;
 
     thread_local! {
         /// `smg_http_requests_total`.
@@ -159,6 +183,12 @@ mod handles {
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
+        /// `smg_worker_requests_active`.
+        pub(super) static WORKER_REQUESTS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_consecutive_failures`.
+        pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_consecutive_successes`.
+        pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
     }
 
     #[cfg(test)]
@@ -171,6 +201,9 @@ mod handles {
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
+        WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
     }
 
     #[cfg(test)]
@@ -2335,12 +2368,36 @@ impl Metrics {
     }
 
     pub fn set_worker_requests_active(worker: &str, count: usize) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_requests_active",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_REQUESTS_ACTIVE,
+            worker,
+            count as f64,
+            || {
+                gauge!(
+                    "smg_worker_requests_active",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
+    }
+
+    /// Sets a per-worker gauge that moves on every request: through this
+    /// thread's kept handle for `worker` (built by `build` on first sight and
+    /// dropped when the worker set changes), or through a key built per call
+    /// when handles are not kept.
+    fn set_worker_gauge(
+        kept: &'static std::thread::LocalKey<std::cell::RefCell<handles::WorkerGauges>>,
+        worker: &str,
+        value: f64,
+        build: impl FnOnce() -> metrics::Gauge,
+    ) {
+        if !handles::keep_handles() {
+            build().set(value);
+            return;
+        }
+        kept.with_borrow_mut(|kept| {
+            handles::with_handle(kept.current(), worker, build, |gauge| gauge.set(value));
+        });
     }
 
     /// Set active routing keys per worker
@@ -2702,22 +2759,32 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_cb_consecutive_failures",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_CB_FAILURES,
+            worker,
+            f64::from(count),
+            || {
+                gauge!(
+                    "smg_worker_cb_consecutive_failures",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
     }
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_cb_consecutive_successes",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_CB_SUCCESSES,
+            worker,
+            f64::from(count),
+            || {
+                gauge!(
+                    "smg_worker_cb_consecutive_successes",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
     }
 
     // ========================================================================
