@@ -280,8 +280,14 @@ What the syntax says, and what the assembler does with it:
   call's end the bytes held come first and the one event of no bytes stands after them, before
   `ToolCallEnd`, as `tagged::end_cut_call` has it); a call that started keeps the pairs it read
   (`{}` when none), and a block that named no call has every byte refused, the marker that
-  closed it included. The attributed, XML and Qwen-tagged
-  assemblers still carry such bytes in the `Malformed` event, which the adapters show.
+  closed it included. The attributed assembler (`tagged::attributed`: DSML, XTML, `<parameter
+  name="…">`) refuses the same way everything inside an invoke its syntax cannot read: a word
+  between tags, a tag out of its place or cut short, a tail a tag has no place for, an invoke
+  that named no call (whole, its closing tag included); a call that started keeps the members it
+  read. (A parameter tag written without its `<` and a call's arguments written as JSON and
+  closed with a region of the model's own, both seen live, reached the client as content with
+  the format's tokens in it before.) The XML and Qwen-tagged assemblers still carry such bytes in
+  the `Malformed` event, which the adapters show.
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what
@@ -296,7 +302,8 @@ What the syntax says, and what the assembler does with it:
   written whole at `</parameter>` through `json`, which reads the JSON the template writes
   for a number, a boolean, a list, an object or null (`tojson`), and infers the rest. A
   parameter tag with anything between the name's closing quote and `>` is no parameter tag the
-  syntax has: the whole tag comes back as `Malformed`, and no parameter opens.
+  syntax has: the whole tag is refused (a `Malformed` event of no bytes, the bytes as `Dropped {
+  MalformedCall }`), and no parameter opens.
 - **Or the tag's `string` attribute types the value** (`Typing::StringAttribute`, DSML):
   `string="true"` is the text, streamed like a declared string; `string="false"` is JSON the
   model wrote, written whole at the close through `json`'s inference. The request's tools are
@@ -317,8 +324,8 @@ What the syntax says, and what the assembler does with it:
   opener and closer are the template's wrapping and go into the fragments' sources, not the
   value; the text between them is the value as it is, streamed as it arrives for a declared
   string, read whole at the closing tag for any other type. Text between `]]>` and the closing
-  tag, which the template never writes, is reported; a value held whole for its close is written
-  at the first word of it, as the section has it, so that the report never takes the bytes it is
+  tag, which the template never writes, is refused; a value held whole for its close is written
+  at the first word of it, as the section has it, so that the refusal never takes the bytes it is
   held in, and the closing tag then leaves as the syntax's wrapping (`Dropped { Wrapper }`).
 - **A value may stand on its own line** (`Tags::value_on_its_own_line`): dots3's template
   writes a newline after the parameter tag and one before its closing tag. Those two are the
@@ -326,7 +333,7 @@ What the syntax says, and what the assembler does with it:
   value is dropped when it is a newline, and a trailing newline is held until the closing tag
   says it was the framing, or more text says it was the value's.
 - **The newlines between the tags are the template's** and go into the next event's source;
-  text where the syntax has tags is reported.
+  text where the syntax has tags is refused (counted, never content).
 - **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
   end before it, and inside a streamed string closes the string first, as the keyed assembler's
   does (`tagged::left_open`), except that a held tail beginning with one of the family's

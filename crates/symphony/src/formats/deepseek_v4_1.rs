@@ -466,10 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn an_invoke_that_named_nothing_is_reported_however_it_ended() {
+    fn an_invoke_that_named_nothing_is_refused_whole_however_it_ended() {
         // The invoke tag cut short before its name, ended by the block's close, by the next
-        // invoke's opening, or by its own closing tag: each ending's bytes come back as
-        // `Malformed`, and no call is counted for it.
+        // invoke's opening, or by its own closing tag: each ending's bytes are refused (counted
+        // by an event of no bytes, dropped as the model's failed call, never content), and no
+        // call is counted for it.
         for (output, ending) in [
             (
                 "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ calls>",
@@ -487,10 +488,18 @@ mod tests {
         ] {
             let events = run("<think>\n\n</think>\n\n", &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the counted event of no bytes, the bytes dropped, never content.
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
+                )),
+                "{ending}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
                 )),
                 "{ending}: {events:?}"
             );
@@ -571,18 +580,23 @@ mod tests {
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "1"}"#);
-        let malformed: Vec<&str> = events
+        // The tag with its tail is refused: its bytes dropped as the model's failed call, never
+        // content, behind the counted event of no bytes.
+        let refused: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();
         assert!(
-            malformed
+            refused
                 .iter()
                 .any(|text| text.ends_with("<｜DSML｜ parameter name=\"x\" kind=\"y\">")),
-            "{malformed:?}"
+            "{refused:?}"
         );
     }
 

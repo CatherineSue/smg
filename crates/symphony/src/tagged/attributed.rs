@@ -293,8 +293,8 @@ pub struct Assembler {
     stage: Stage,
     /// The function's name once its tag is whole, which is when `ToolCallStart` was pushed.
     function: Option<String>,
-    /// Whether text between tags was released as content since the last tag the syntax read: a
-    /// word where the syntax has tags, a tag out of its place, a tag reported with its bytes. The
+    /// Whether text between tags was refused since the last tag the syntax read: a word where
+    /// the syntax has tags, a tag out of its place, a tag refused with its bytes. The
     /// whitespace carried after it is the model's, between two pieces of its text, and leaves with
     /// the next piece; before any, the whitespace after a tag is the template's, dropped before a
     /// report or carried into the next event's source.
@@ -397,13 +397,14 @@ impl Assembler {
 
     /// The invoke's end: `terminal` is the closing tag the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. After the last parameter the
-    /// object is closed and the call ends; inside a value held for its close what was held comes
-    /// back as `Malformed` and the object closes without that member; inside a value whose member
-    /// was already written at its section's close nothing is reported, and the object closes after
-    /// that member with the whitespace carried since the section as the close's source; inside a
-    /// streamed string the string is closed first ([`Self::close_open_string`]), since the model
-    /// ended the call and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }`
-    /// event of no bytes; an invoke that never named a function has its bytes reported.
+    /// object is closed and the call ends; inside a value held for its close what was held is
+    /// refused (the counted event of no bytes, the bytes as `Dropped { MalformedCall }`) and the
+    /// object closes without that member; inside a value whose member was already written at its
+    /// section's close nothing is reported, and the object closes after that member with the
+    /// whitespace carried since the section as the close's source; inside a streamed string the
+    /// string is closed first ([`Self::close_open_string`]), since the model ended the call and
+    /// its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no bytes;
+    /// an invoke that never named a function is refused whole, the terminal included.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -425,7 +426,7 @@ impl Assembler {
             };
             self.object.carried.push_str(terminal);
             if let Some(why) = why {
-                self.object.report(why, out);
+                self.object.refuse(why, out);
             }
             return;
         }
@@ -435,8 +436,8 @@ impl Assembler {
             // text that followed is the close's source, as between tags.
             Stage::Value(ValueState { written: true, .. }) => {}
             // A name, a tag or a value held for its close that the end cut short: its bytes are
-            // reported, its member is never written, and the object closes.
-            _ => self.object.report(MalformedReason::TagCutShort, out),
+            // refused, its member is never written, and the object closes.
+            _ => self.object.refuse(MalformedReason::TagCutShort, out),
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
         self.object.close(source, out);
@@ -466,7 +467,9 @@ impl Assembler {
     /// ([`Self::cut_value`]). A call that started still ends, with no bytes of its own, as every
     /// assembler ends one, after the one `Malformed { UnterminatedRegion }` event of no bytes
     /// that says that its arguments are no whole value ([`end_cut_call`]); what a block that
-    /// named no call held comes back as `Malformed { UnterminatedRegion }`.
+    /// named no call held is refused as `UnterminatedRegion`, as the keyed assembler refuses it,
+    /// so that the reader's release of a refused output that made no call takes the whole slice
+    /// (a `Malformed` event with bytes would end that release).
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -476,12 +479,7 @@ impl Assembler {
             self.object.carried.push_str(&held);
             let held = self.scanner.held().to_string();
             self.object.carried.push_str(&held);
-            if !self.object.carried.is_empty() {
-                out.push(Event::Malformed {
-                    text: Text::uncounted(std::mem::take(&mut self.object.carried)),
-                    why: MalformedReason::UnterminatedRegion,
-                });
-            }
+            self.object.refuse(MalformedReason::UnterminatedRegion, out);
             return;
         }
         let cut_tag = if matches!(self.stage, Stage::Value(_)) {
@@ -589,8 +587,8 @@ impl Assembler {
     /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
     /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): after
     /// the last parameter the object is closed, a name, a tag or a value held for its close that
-    /// the stop found open is reported and the object closes without that member, an invoke that
-    /// never named a function has its bytes reported. A streamed string still open is closed
+    /// the stop found open is refused and the object closes without that member, an invoke that
+    /// never named a function is refused whole. A streamed string still open is closed
     /// first ([`Self::close_open_string`]), under the stop's word. One `Malformed { OpenAtTheStop }`
     /// event of no bytes stands before the fragment that closes what was open
     /// ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed under any
@@ -694,7 +692,7 @@ impl Assembler {
             Stage::Value(_) if tag == CLOSE => self.close_value(bytes, out),
             // Inside a value, the other tags are the value's text.
             Stage::Value(_) => self.text(bytes, declared, out),
-            // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
+            // A tag cuts a name or a tag's tail short: the bytes so far are refused, and the tag
             // is read where they began.
             _ => {
                 self.report(MalformedReason::TagCutShort, out);
@@ -831,31 +829,37 @@ impl Assembler {
         }
     }
 
-    /// `text` the syntax has no place for (a word between tags, a tag out of its place), released
-    /// as `Malformed` with `why`, which the chat surface shows as content. The whitespace carried
-    /// before it is the template's after a tag the syntax read, and is dropped so the report holds
-    /// the model's text alone; after text released already it is the model's, between two pieces
-    /// of its text, and leaves with this one, so that a client reads what the model wrote, byte
-    /// for byte, however the bytes were cut.
+    /// `text` the syntax has no place for (a word between tags, a tag out of its place), refused
+    /// ([`refuse`](super::refuse)): a `Malformed` event of no bytes with `why`, which a reader
+    /// counts at its offset, and the bytes as `Dropped { MalformedCall }`, which no adapter shows.
+    /// The bytes are the model's failed call, not its answer: the families' own parsers drop
+    /// them, and a client shown them read the format's tags inside the message (a parameter tag
+    /// written without its `<`, a call's arguments written as JSON and closed with a region of
+    /// the model's own). The whitespace carried before the text is the template's after a tag the
+    /// syntax read, and is dropped on its own so the refused bytes hold the model's text alone;
+    /// after text refused already it is the model's, between two pieces of its text, and leaves
+    /// with this one, so that every byte is accounted for however the bytes were cut.
     fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
         if !self.released {
             self.object.drop_carried(out);
         }
         self.object.carried.push_str(text);
-        self.report(why, out);
+        self.object.refuse(why, out);
+        self.released = true;
     }
 
-    /// The carried bytes as `Malformed` with `why` ([`Object::report`]), when there are any:
-    /// released, so the whitespace after them is the model's.
+    /// The carried bytes refused with `why` ([`Object::refuse`]: the counted event of no bytes,
+    /// then the bytes as `Dropped { MalformedCall }`), when there are any; released, so the
+    /// whitespace after them is the model's.
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.object.carried.is_empty() {
             return;
         }
-        self.object.report(why, out);
+        self.object.refuse(why, out);
         self.released = true;
     }
 
-    /// The invoke tag is whole: the call starts. A tail after the name's quote is reported first,
+    /// The invoke tag is whole: the call starts. A tail after the name's quote is refused first,
     /// unless it is the model's index of the call and the family's tags carry one.
     fn start_call(&mut self, name: String, tail: &str, out: &mut Events) {
         self.function = Some(name.clone());
@@ -867,7 +871,7 @@ impl Assembler {
                 source: Text::uncounted(std::mem::take(&mut self.object.carried)),
             });
         } else {
-            // The tag's bytes up to the tail stay as the start's source; the tail is reported, and
+            // The tag's bytes up to the tail stay as the start's source; the tail is refused, and
             // the tag's end stays carried.
             let end = self.tags.tag_end.text();
             let tag_end = self.object.carried.len() - tail.len() - end.len();
@@ -879,10 +883,7 @@ impl Assembler {
                 name,
                 source: Text::uncounted(std::mem::take(&mut self.object.carried)),
             });
-            out.push(Event::Malformed {
-                text: Text::uncounted(after),
-                why: MalformedReason::TagTail,
-            });
+            super::refuse(after, MalformedReason::TagTail, out);
             self.object.carried.push_str(&close);
         }
         self.stage = Stage::Between;
@@ -891,8 +892,8 @@ impl Assembler {
 
     /// The parameter tag is whole: the value begins, typed by what the tool declares for the key,
     /// or by the tag's `string` attribute. A tag with any other tail after the name's quote
-    /// (`<parameter name="x" type="int">`) is not one the syntax has: the whole tag comes back as
-    /// `Malformed`, and no parameter opens.
+    /// (`<parameter name="x" type="int">`) is not one the syntax has: the whole tag is refused,
+    /// and no parameter opens.
     fn open_value(&mut self, key: String, tail: &str, declared: &Declared, out: &mut Events) {
         let (kind, mode) = match (self.tags.typing, tail) {
             (Typing::Declared, "") => {
@@ -1034,9 +1035,9 @@ impl Assembler {
     }
 
     /// Text after a CDATA section closed, where only the closing tag should follow: whitespace
-    /// is carried, a word is text between tags ([`Self::text_between`]), reported with the
+    /// is carried, a word is text between tags ([`Self::text_between`]), refused with the
     /// whitespace before it dropped. A value held whole for its close is written before the
-    /// first word ([`Self::write_held_value`]): the report would take the carried bytes, and the
+    /// first word ([`Self::write_held_value`]): the refusal would take the carried bytes, and the
     /// value is among them.
     fn after_the_section(&mut self, text: &str, out: &mut Events) {
         if runs(text).any(|(_, space)| !space) {
@@ -1248,11 +1249,30 @@ mod tests {
             .collect()
     }
 
+    /// The bytes dropped as the template's wrapping, in order.
     fn dropped(events: &[Event]) -> Vec<String> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.to_string()),
+                Event::Dropped {
+                    text,
+                    why: DropReason::Wrapper,
+                } => Some(text.text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bytes refused as the model's failed call, in order: the `Dropped { MalformedCall }`
+    /// events, which no adapter shows.
+    fn refused(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
@@ -1298,12 +1318,21 @@ mod tests {
         "<|close|>argument<|sep|>"
     );
 
-    /// No fragment is empty and no `Malformed` or `Dropped` text is empty: an empty report would
-    /// claim a byte where none was.
+    /// No fragment is empty and no `Malformed` or `Dropped` text is empty, but for the one event
+    /// of no bytes that counts a refused run and stands right before its `Dropped {
+    /// MalformedCall }`: any other empty report would claim a byte where none was.
     fn nothing_empty(events: &[Event]) {
-        for event in events {
+        for (at, event) in events.iter().enumerate() {
             match event {
                 Event::ToolCallArguments { json, .. } => assert!(!json.is_empty(), "{event:?}"),
+                Event::Malformed { text, .. } if text.text.is_empty() => assert!(
+                    matches!(
+                        events.get(at + 1),
+                        Some(Event::Dropped { text, why: DropReason::MalformedCall })
+                            if !text.text.is_empty()
+                    ),
+                    "{event:?}: an empty report with no refused bytes after it"
+                ),
                 Event::Malformed { text, .. } | Event::Dropped { text, .. } => {
                     assert!(!text.text.is_empty(), "{event:?}");
                 }
@@ -1371,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn an_xtml_type_the_syntax_lacks_and_a_tail_that_is_no_index_are_reported() {
+    fn an_xtml_type_the_syntax_lacks_and_a_tail_that_is_no_index_are_refused() {
         let call = concat!(
             "f\" index=\"x\"<|sep|>",
             "<|open|>argument key=\"a\" type=\"date\"<|sep|>2026<|close|>argument<|sep|>",
@@ -1379,19 +1408,18 @@ mod tests {
         );
         let events = run_with(Tags::XTML, &[call], false);
         assert_eq!(arguments(&events), r#"{"b": 2}"#);
-        let reported: Vec<String> = malformed(&events)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
+        // Both are refused: counted by events of no bytes, the bytes never content.
         assert!(
-            reported.contains(&" index=\"x\"".to_string()),
-            "{reported:?}"
+            malformed(&events).iter().all(|(text, _)| text.is_empty()),
+            "{:?}",
+            malformed(&events)
         );
-        // The call tag's separator, carried after its tail was reported, leads the bad tag's bytes.
+        let refused = refused(&events);
+        assert!(refused.contains(&" index=\"x\"".to_string()), "{refused:?}");
+        // The call tag's separator, carried after its tail was refused, leads the bad tag's bytes.
         assert!(
-            reported
-                .contains(&"<|sep|><|open|>argument key=\"a\" type=\"date\"<|sep|>".to_string()),
-            "{reported:?}"
+            refused.contains(&"<|sep|><|open|>argument key=\"a\" type=\"date\"<|sep|>".to_string()),
+            "{refused:?}"
         );
         assert_eq!(bytes(&events), format!("{call}{}", Tags::XTML.invoke_close));
     }
@@ -1444,9 +1472,7 @@ mod tests {
         let events = out.drain();
         nothing_empty(&events);
         assert_eq!(arguments(&events), "{}");
-        assert!(malformed(&events)
-            .iter()
-            .any(|(text, _)| text.ends_with("12")));
+        assert!(refused(&events).iter().any(|text| text.ends_with("12")));
     }
 
     #[test]
@@ -1513,12 +1539,12 @@ mod tests {
 
     /// A parameter tag written with another attribute's name, `<parameter key="s">`, which the
     /// syntax has no tag for, in every family's spelling: the invoke is read with no arguments,
-    /// and the model's lines reach the client as content, byte for byte, the whitespace between
-    /// the words and the newline between the lines included, the same however the bytes are cut.
-    /// The template's newline after the invoke tag, where the family writes one, is dropped, and
-    /// the one before its close is the object's source.
+    /// the model's lines never reach the client, and every byte of them is refused, the
+    /// whitespace between the words and the newline between the lines included, the same however
+    /// the bytes are cut. The template's newline after the invoke tag, where the family writes
+    /// one, is dropped, and the one before its close is the object's source.
     #[test]
-    fn text_between_tags_reaches_the_client_as_the_model_wrote_it_in_every_spelling() {
+    fn text_between_tags_never_reaches_the_client_and_is_refused_whole_in_every_spelling() {
         const M2_CALL: &str = concat!(
             "f\">\n<parameter key=\"s\">Paris</parameter>\n",
             "<parameter key=\"n\">three or four</parameter>\n"
@@ -1567,7 +1593,8 @@ mod tests {
                 "{tags:?}: {whole:?}"
             );
             assert_eq!(arguments(&whole), "{}", "{tags:?}");
-            assert_eq!(shown(&whole), lines, "{tags:?}");
+            assert_eq!(shown(&whole), "", "{tags:?}");
+            assert_eq!(refused(&whole).concat(), lines, "{tags:?}");
             assert_eq!(dropped(&whole), before, "{tags:?}");
             assert_eq!(bytes(&whole), all, "{tags:?}");
             nothing_empty(&whole);
@@ -1584,7 +1611,8 @@ mod tests {
             );
             for pieces in cuts {
                 let events = run_with(tags, &pieces, false);
-                assert_eq!(shown(&events), lines, "{tags:?}: {pieces:?}");
+                assert_eq!(shown(&events), "", "{tags:?}: {pieces:?}");
+                assert_eq!(refused(&events).concat(), lines, "{tags:?}: {pieces:?}");
                 assert_eq!(arguments(&events), "{}", "{tags:?}: {pieces:?}");
                 assert_eq!(dropped(&events), before, "{tags:?}: {pieces:?}");
                 assert_eq!(bytes(&events), all, "{tags:?}: {pieces:?}");
@@ -1669,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn a_parameter_tag_with_a_tail_is_no_parameter_and_the_text_is_reported() {
+    fn a_parameter_tag_with_a_tail_is_no_parameter_and_the_text_is_refused() {
         let text = "f\">\n<parameter name=\"n\" type=\"int\">1</parameter>\n";
         let events = run(&[text], false);
         assert_eq!(
@@ -1677,33 +1705,61 @@ mod tests {
             format!("{text}{}", Tags::MINIMAX_M2.invoke_close)
         );
         let reported = malformed(&events);
-        assert_eq!(reported[0].1, MalformedReason::TagTail);
-        // The template's newline before the tag rides in the report, as every report carries
-        // what was held before it.
-        assert_eq!(reported[0].0, "\n<parameter name=\"n\" type=\"int\">");
-        // `1` is text where the syntax has tags, and the stray close has no place.
+        // The tag with its tail, `1` (text where the syntax has tags) and the stray close are all
+        // refused: counted by an event of no bytes each, the bytes never content. The template's
+        // newline before the tag rides with the tag's bytes, as every report carried what was held
+        // before it.
         assert_eq!(
-            reported[1],
-            ("1".to_string(), MalformedReason::TextBetweenTags)
+            reported,
+            [
+                (String::new(), MalformedReason::TagTail),
+                (String::new(), MalformedReason::TextBetweenTags),
+                (String::new(), MalformedReason::TagOutOfPlace)
+            ]
         );
-        assert_eq!(reported[2].1, MalformedReason::TagOutOfPlace);
+        assert_eq!(
+            refused(&events),
+            ["\n<parameter name=\"n\" type=\"int\">", "1", "</parameter>"]
+        );
+        assert_eq!(shown(&events), "");
         assert_eq!(arguments(&events), "{}");
     }
 
+    /// An invoke that never named a call is refused whole, its closing tag included: the client
+    /// reads nothing of it, as the keyed syntax has it for a block that named no call.
     #[test]
-    fn an_invoke_that_closes_inside_its_name_is_reported_and_starts_no_call() {
+    fn an_invoke_that_closes_inside_its_name_is_refused_whole_and_starts_no_call() {
         let events = run(&["get_wea"], false);
         assert_eq!(
             bytes(&events),
             format!("get_wea{}", Tags::MINIMAX_M2.invoke_close)
         );
         assert_eq!(
-            malformed(&events)[0].1,
-            MalformedReason::ClosedBeforeTheName
+            malformed(&events),
+            [(String::new(), MalformedReason::ClosedBeforeTheName)]
+        );
+        assert_eq!(
+            refused(&events),
+            [format!("get_wea{}", Tags::MINIMAX_M2.invoke_close)]
         );
         assert!(!events
             .iter()
             .any(|e| matches!(e, Event::ToolCallStart { .. })));
+        // A name a tag cuts short, a parameter the unnamed call cannot take and the close: three
+        // refused runs, every byte in them, nothing shown.
+        let cut = run(&["f<parameter name=\"s\">x</parameter>"], false);
+        assert_eq!(
+            bytes(&cut),
+            format!(
+                "f<parameter name=\"s\">x</parameter>{}",
+                Tags::MINIMAX_M2.invoke_close
+            )
+        );
+        assert_eq!(shown(&cut), "");
+        assert_eq!(refused(&cut).concat(), bytes(&cut));
+        assert!(malformed(&cut).iter().all(|(text, _)| text.is_empty()));
+        nothing_empty(&cut);
+        assert!(!cut.iter().any(|e| matches!(e, Event::ToolCallStart { .. })));
     }
 
     #[test]
@@ -1715,15 +1771,13 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"s": "a <parameter name=\"x\"> b"}"#);
         let cut = run(&["f\">\n<parameter name=\"n\">12"], false);
         // The close cuts a whole value: the tag and the digits, held for the value's close that
-        // never came, are reported together, and the object closes empty.
+        // never came, are refused together, and the object closes empty.
         assert_eq!(arguments(&cut), "{}");
         assert_eq!(
             malformed(&cut)[0],
-            (
-                "\n<parameter name=\"n\">12".to_string(),
-                MalformedReason::TagCutShort
-            )
+            (String::new(), MalformedReason::TagCutShort)
         );
+        assert_eq!(refused(&cut), ["\n<parameter name=\"n\">12"]);
     }
 
     /// The invoke's close inside a streamed string, by its own closing tag or the block's end:
@@ -1876,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn text_after_a_cdata_closer_is_reported_and_a_cut_section_keeps_its_held_bytes() {
+    fn text_after_a_cdata_closer_is_refused_and_a_cut_section_keeps_its_held_bytes() {
         let events = run_with(
             Tags::MINICPM5,
             &["f\"><param name=\"s\"><![CDATA[x]]>tail</param>"],
@@ -1885,8 +1939,9 @@ mod tests {
         assert_eq!(arguments(&events), r#"{"s": "x"}"#);
         assert_eq!(
             malformed(&events),
-            vec![("tail".to_string(), MalformedReason::TextBetweenTags)]
+            vec![(String::new(), MalformedReason::TextBetweenTags)]
         );
+        assert_eq!(refused(&events), ["tail"]);
         // Cut with a `]` held: the byte is the value's text, in the value, not lost and not
         // content.
         let cut = run_with(Tags::MINICPM5, &["f\"><param name=\"s\"><![CDATA[x]"], true);
@@ -1917,8 +1972,7 @@ mod tests {
     /// every cut and one character at a time. (The word used to drop the carried value as the
     /// template's spacing, and the closing tag then sliced past the carried bytes.)
     #[test]
-    fn a_whole_value_in_a_cdata_section_followed_by_a_word_is_written_and_the_word_reported() {
-        use crate::event::DropReason;
+    fn a_whole_value_in_a_cdata_section_followed_by_a_word_is_written_and_the_word_refused() {
         for (call, expected, word) in [
             (
                 "f\"><param name=\"o\"><![CDATA[{\"k\": 1}]]>tail</param>",
@@ -1952,9 +2006,10 @@ mod tests {
             assert_eq!(arguments(&whole), expected, "{call}");
             assert_eq!(
                 malformed(&whole),
-                vec![(word.to_string(), MalformedReason::TextBetweenTags)],
+                vec![(String::new(), MalformedReason::TextBetweenTags)],
                 "{call}"
             );
+            assert_eq!(refused(&whole), [word], "{call}");
             assert!(
                 whole.iter().any(|event| matches!(
                     event,
@@ -1977,17 +2032,18 @@ mod tests {
                 let events = run_with(Tags::MINICPM5, &pieces, false);
                 nothing_empty(&events);
                 assert_eq!(arguments(&events), expected, "{pieces:?}");
-                // A cut inside the word splits its report in two; the bytes a client reads are
-                // the word's.
+                // A cut inside the word splits its report in two; the bytes refused are the
+                // word's, and the client reads none of them.
                 let reported = malformed(&events);
                 assert!(
                     reported
                         .iter()
-                        .all(|(_, why)| *why == MalformedReason::TextBetweenTags),
+                        .all(|(text, why)| text.is_empty()
+                            && *why == MalformedReason::TextBetweenTags),
                     "{pieces:?}: {reported:?}"
                 );
-                let shown: String = reported.iter().map(|(text, _)| text.as_str()).collect();
-                assert_eq!(shown, word, "{pieces:?}");
+                assert_eq!(refused(&events).concat(), word, "{pieces:?}");
+                assert_eq!(shown(&events), "", "{pieces:?}");
                 assert_eq!(bytes(&events), all, "{pieces:?}");
             }
         }
@@ -2008,8 +2064,9 @@ mod tests {
         assert_eq!(arguments(&spaced), r#"{"o": {"k": 1}}"#);
         assert_eq!(
             malformed(&spaced),
-            vec![("tail".to_string(), MalformedReason::TextBetweenTags)]
+            vec![(String::new(), MalformedReason::TextBetweenTags)]
         );
+        assert_eq!(refused(&spaced), ["tail"]);
         assert_eq!(
             bytes(&spaced),
             "f\"><param name=\"o\"><![CDATA[{\"k\": 1}]]> \ntail</param></function>"
@@ -2027,8 +2084,9 @@ mod tests {
         assert_eq!(arguments(&closed), r#"{"o": {"k": 1}}"#);
         assert_eq!(
             malformed(&closed),
-            vec![("tail".to_string(), MalformedReason::TextBetweenTags)]
+            vec![(String::new(), MalformedReason::TextBetweenTags)]
         );
+        assert_eq!(refused(&closed), ["tail"]);
         assert_eq!(bytes(&closed), format!("{call}</function>"));
         let cut = run_with(Tags::MINICPM5, &[call], true);
         assert_eq!(arguments(&cut), r#"{"o": {"k": 1}"#);
