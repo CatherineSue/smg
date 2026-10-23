@@ -461,6 +461,9 @@ struct Router {
     client_key_path: Option<String>,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
+    decode_expected_workers: Option<usize>,
+    decode_min_ready_percent: Option<u8>,
+    decode_min_ready_workers: Option<usize>,
     decode_policy: Option<PolicyType>,
     decode_selector: HashMap<String, String>,
     decode_urls: Option<Vec<String>>,
@@ -560,7 +563,10 @@ struct Router {
     pd_pairing_mode: String,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
+    prefill_expected_workers: Option<usize>,
     prefill_max_inflight_requests_per_worker: i32,
+    prefill_min_ready_percent: Option<u8>,
+    prefill_min_ready_workers: Option<usize>,
     prefill_policy: Option<PolicyType>,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -784,6 +790,29 @@ impl Router {
         }
     }
 
+    /// Build optional per-role readiness thresholds from Python arguments.
+    fn pd_readiness_config(&self) -> Option<config::PdReadinessConfig> {
+        let configured = self.prefill_expected_workers.is_some()
+            || self.prefill_min_ready_workers.is_some()
+            || self.prefill_min_ready_percent.is_some()
+            || self.decode_min_ready_workers.is_some()
+            || self.decode_expected_workers.is_some()
+            || self.decode_min_ready_percent.is_some();
+        configured.then(|| config::PdReadinessConfig {
+            prefill: config::ReadinessRoleConfig {
+                expected_workers: self.prefill_expected_workers,
+                min_healthy_workers: self.prefill_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.prefill_min_ready_percent,
+            },
+            decode: config::ReadinessRoleConfig {
+                expected_workers: self.decode_expected_workers,
+                min_healthy_workers: self.decode_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.decode_min_ready_percent,
+            },
+        })
+    }
+
+    /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
@@ -1094,6 +1123,7 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .pd_readiness(self.pd_readiness_config())
             .admin_port(self.admin_port)
             .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
@@ -1314,6 +1344,9 @@ impl Router {
         client_key_path = None,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
+        decode_expected_workers = None,
+        decode_min_ready_percent = None,
+        decode_min_ready_workers = None,
         decode_policy = None,
         decode_selector = HashMap::new(),
         decode_urls = None,
@@ -1406,7 +1439,10 @@ impl Router {
         pd_pairing_mode = String::from("lenient"),
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
+        prefill_expected_workers = None,
         prefill_max_inflight_requests_per_worker = -1,
+        prefill_min_ready_percent = None,
+        prefill_min_ready_workers = None,
         prefill_policy = None,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1494,6 +1530,7 @@ impl Router {
         zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
+    /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1528,6 +1565,9 @@ impl Router {
         client_key_path: Option<String>,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
+        decode_expected_workers: Option<usize>,
+        decode_min_ready_percent: Option<u8>,
+        decode_min_ready_workers: Option<usize>,
         decode_policy: Option<PolicyType>,
         decode_selector: HashMap<String, String>,
         decode_urls: Option<Vec<String>>,
@@ -1620,7 +1660,10 @@ impl Router {
         pd_pairing_mode: String,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
+        prefill_expected_workers: Option<usize>,
         prefill_max_inflight_requests_per_worker: i32,
+        prefill_min_ready_percent: Option<u8>,
+        prefill_min_ready_workers: Option<usize>,
         prefill_policy: Option<PolicyType>,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -1779,6 +1822,9 @@ impl Router {
             client_key_path,
             control_plane_auth,
             cors_allowed_origins,
+            decode_expected_workers,
+            decode_min_ready_percent,
+            decode_min_ready_workers,
             decode_policy,
             decode_selector,
             decode_urls,
@@ -1871,7 +1917,10 @@ impl Router {
             pd_pairing_mode,
             postgres_config,
             power_of_two_load_metric,
+            prefill_expected_workers,
             prefill_max_inflight_requests_per_worker,
+            prefill_min_ready_percent,
+            prefill_min_ready_workers,
             prefill_policy,
             prefill_queue_size,
             prefill_queue_timeout_secs,
