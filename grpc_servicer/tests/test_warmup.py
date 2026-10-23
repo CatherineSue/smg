@@ -565,6 +565,127 @@ def test_a_flush_the_engine_refuses_is_a_line_not_a_failure(caplog):
     wire.flush_cache = lambda: (_ for _ in ()).throw(RuntimeError("UNIMPLEMENTED"))
     report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
     assert report.flushed is False and "was not flushed" in report.summary()
+    # The end line says why, in the wire's words; so does the line at the refusal.
+    assert report.flush_refusal == "UNIMPLEMENTED"
+    assert report.summary().endswith("(the warm-up's blocks stay cached): UNIMPLEMENTED")
+    assert "The warm-up's cache flush was not accepted: UNIMPLEMENTED" in caplog.text
+
+
+@pytest.mark.parametrize("module", [vllm_warmup, sglang_warmup, tokenspeed_warmup])
+def test_a_flush_the_servicer_answers_as_refused_raises_its_message(module):
+    """A refusal the servicer answers (success false, with its reason) reaches
+    the warm-up's end line like a raised status: the wire raises the message.
+    An answer with no words stays a plain False; success stays True."""
+    wire = module.GrpcWire.__new__(module.GrpcWire)
+    refused = common_pb2.FlushCacheResponse(
+        success=False, message="KV prefix cache reset refused; requests may be in flight"
+    )
+    wire._stub = SimpleNamespace(FlushCache=lambda request, timeout=None: refused)
+    with pytest.raises(RuntimeError, match="requests may be in flight"):
+        wire.flush_cache()
+    flushed, refusal = warmup._flush(wire, logging.getLogger("test"))
+    assert (flushed, refusal) == (False, "KV prefix cache reset refused; requests may be in flight")
+    wire._stub = SimpleNamespace(
+        FlushCache=lambda request, timeout=None: common_pb2.FlushCacheResponse(success=False)
+    )
+    assert wire.flush_cache() is False
+    wire._stub = SimpleNamespace(
+        FlushCache=lambda request, timeout=None: common_pb2.FlushCacheResponse(success=True)
+    )
+    assert wire.flush_cache() is True
+
+
+def test_a_status_with_empty_details_is_worded_by_its_code():
+    """A status whose details are empty would put its multi-line repr on the
+    end line; its code's name is the one-line reason instead."""
+
+    class _Status(Exception):
+        def details(self):
+            return ""
+
+        def code(self):
+            return SimpleNamespace(name="UNAVAILABLE")
+
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = UNAVAILABLE\n>"
+
+    assert warmup._refusal(_Status()) == "UNAVAILABLE"
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status())
+    flushed, refusal = warmup._flush(wire, logging.getLogger("test"))
+    assert (flushed, refusal) == (False, "UNAVAILABLE") and "\n" not in refusal
+
+
+def test_a_multi_line_refusal_is_worded_on_one_line():
+    """Details with newlines (an engine's multi-line message forwarded by the
+    servicer), and an exception text with newlines, read as one line on the
+    end line; whitespace-only details fall through to the code's name."""
+
+    class _Status(Exception):
+        def __init__(self, text):
+            super().__init__(text)
+            self._text = text
+
+        def details(self):
+            return self._text
+
+        def code(self):
+            return SimpleNamespace(name="FAILED_PRECONDITION")
+
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = ...\n>"
+
+    assert (
+        warmup._refusal(_Status("engine busy:\n\tflush refused while 3 requests run\n"))
+        == "engine busy: flush refused while 3 requests run"
+    )
+    assert warmup._refusal(_Status(" \n\t ")) == "FAILED_PRECONDITION"
+    assert warmup._refusal(RuntimeError("line one\nline two")) == "line one line two"
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status("a\nb"))
+    report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
+    assert report.flush_refusal == "a b"
+    assert "\n" not in report.summary() and report.summary().endswith(": a b")
+
+
+def test_a_refused_flush_is_worded_by_the_status_details_not_its_repr():
+    """A gRPC status' ``str`` runs over several lines (code, details, debug
+    string); the end line carries its ``details()`` alone."""
+
+    class _Status(RuntimeError):
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = UNIMPLEMENTED\n>"
+
+        def details(self):
+            return "FlushCache is not available through this servicer: the wire carries no flush"
+
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status())
+    report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
+    assert report.flushed is False
+    assert report.flush_refusal == (
+        "FlushCache is not available through this servicer: the wire carries no flush"
+    )
+    assert "\n" not in report.summary()
+    assert report.summary().endswith(": " + report.flush_refusal)
+
+
+def test_the_async_pass_words_a_refused_flush_the_same_way():
+    class _Refusing:
+        async def generate(self, request, timeout):
+            return None
+
+        async def flush_cache(self):
+            raise RuntimeError("UNIMPLEMENTED")
+
+        async def close(self):
+            return None
+
+    report = asyncio.run(
+        warmup.run_warmup_async(plan_warmup(SMALL, "fast"), _Refusing(), budget_secs=30)
+    )
+    assert report.flushed is False and report.flush_refusal == "UNIMPLEMENTED"
+    assert report.summary().endswith("(the warm-up's blocks stay cached): UNIMPLEMENTED")
 
 
 def test_the_async_pass_matches_the_blocking_one():
@@ -784,6 +905,8 @@ def test_each_wire_drives_the_plan_through_the_engines_own_service(add, engine, 
     assert sorted(seen.requests) == sorted(expected)
     assert seen.max_inflight >= 2  # the staircase reached the engine together, not one by one
     assert report.flushed is flushable and seen.flushes == (1 if flushable else 0)
+    # A refusal over the wire reaches the end line as the status' details.
+    assert report.flush_refusal == (None if flushable else "no cache flush on this wire")
 
 
 def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
