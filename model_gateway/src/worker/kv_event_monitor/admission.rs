@@ -182,7 +182,7 @@ impl KvEventMonitor {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
         }
@@ -269,7 +269,7 @@ impl KvEventMonitor {
             }
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if snapshot_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
         }
@@ -306,8 +306,9 @@ impl KvEventMonitor {
         }
     }
 
-    /// Publish the parent-less stores a batch produced, if any.
-    fn record_parentless(
+    /// Publish the stores a batch placed without their parent and the
+    /// sub-block stores it left out of the index, if any.
+    fn record_not_indexed(
         worker_url: &str,
         after: &WorkerIndexCounters,
         before: &WorkerIndexCounters,
@@ -315,6 +316,10 @@ impl KvEventMonitor {
         let (stores, blocks) = after.parentless_since(before);
         if stores > 0 {
             Metrics::record_kv_event_parentless(worker_url, stores, blocks);
+        }
+        let (stores, blocks) = after.sub_block_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
         }
     }
 
@@ -558,6 +563,8 @@ mod tests {
         worker: u32,
         state: WorkerStreamState,
         reference: ReferenceIndexer,
+        /// The reference's block of record: the widest block stored so far.
+        block_of_record: i32,
     }
 
     impl Sim {
@@ -569,6 +576,7 @@ mod tests {
                 worker,
                 state: WorkerStreamState::default(),
                 reference: ReferenceIndexer::new(),
+                block_of_record: 0,
             }
         }
 
@@ -585,12 +593,19 @@ mod tests {
         }
 
         /// Apply a batch to the reference with the subscriber's semantics
-        /// (a store whose parent is unknown starts a new chain).
+        /// (a store whose parent is unknown starts a new chain; a store
+        /// narrower than the block of record is left out).
         fn reference_apply(&mut self, b: &KvEventBatch) {
             let seed = namespace_seed(None, None);
             for event in &b.events {
                 match event.data.as_ref().unwrap() {
                     kv_cache_event::Data::Stored(st) => {
+                        let width = st.blocks.first().map_or(0, |block| block.block_size);
+                        if width > self.block_of_record {
+                            self.block_of_record = width;
+                        } else if width > 0 && width < self.block_of_record {
+                            continue;
+                        }
                         let blocks: Vec<StoredBlock> = st
                             .blocks
                             .iter()
@@ -1214,5 +1229,156 @@ mod tests {
             );
             sim.assert_matches_reference();
         });
+    }
+
+    /// A store narrower than the block of record (a hybrid engine's prefix
+    /// entry at its hash granularity, under a parent it never publishes) is
+    /// counted under its own metric and never as parent-less, and the index
+    /// holds what the full blocks made it.
+    #[test]
+    fn sub_block_stores_are_counted_and_not_indexed() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        fn stored_width(parent: Option<i64>, id: i64, width: i32) -> KvCacheEvent {
+            KvCacheEvent {
+                event_id: 0,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: vec![KvBlock {
+                        block_hash: id,
+                        token_ids: (0..width as u32).map(|i| (id as u32) * 64 + i).collect(),
+                        block_size: width,
+                        ..Default::default()
+                    }],
+                    parent_block_hash: parent,
+                    ..Default::default()
+                })),
+            }
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            // Two full blocks, then the tail entry under a parent never
+            // published, in the one batch the engine sends them in.
+            sim.deliver(&batch(
+                1,
+                None,
+                vec![
+                    stored_width(None, 1, 32),
+                    stored_width(Some(1), 2, 32),
+                    stored_width(Some(999), 3, 4),
+                ],
+            ));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 2);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_blocks_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            assert_eq!(sim.state.index.counters.sub_block_stores, 1);
+            assert_eq!(sim.state.index.counters.parentless_stores, 0);
+            // The chain continues from the full block.
+            sim.deliver(&batch(2, None, vec![stored_width(Some(2), 4, 32)]));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 3);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A hybrid engine whose hash granularity is narrower than its block
+    /// registers a prompt's tail entry at that granularity once the request's
+    /// computed tokens reach the next block boundary: in the step that stores
+    /// the full block, a one-hash store of a fraction of the block under an
+    /// intermediate hash the engine never publishes. Its eviction later lists
+    /// the entry beside the full hash. The index keeps the full blocks only:
+    /// no parent-less store, no root chain of one entry.
+    #[test]
+    fn a_tail_entry_beside_a_full_block_under_a_wider_record_is_not_parent_less() {
+        fn run(parent: Option<i64>, ids: &[i64], width: u32) -> KvCacheEvent {
+            KvCacheEvent {
+                event_id: 0,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: ids
+                        .iter()
+                        .map(|&id| KvBlock {
+                            block_hash: id,
+                            token_ids: (0..width).map(|i| (id as u32) * 1000 + i).collect(),
+                            block_size: width as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    parent_block_hash: parent,
+                    ..Default::default()
+                })),
+            }
+        }
+        let mut sim = Sim::new();
+        // The prefix: thirteen full blocks in one store.
+        let prefix: Vec<i64> = (1..=13).collect();
+        sim.deliver(&batch(1, None, vec![run(None, &prefix, 256)]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        // A turn's decode crosses the next block boundary: the full block,
+        // then the prompt's eight-token tail entry under the intermediate
+        // hash one hash-block before it.
+        sim.deliver(&batch(
+            2,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9001), &[901], 8)],
+        ));
+        // The next turn: the same full block again (a second copy) and its
+        // own tail entry.
+        sim.deliver(&batch(
+            3,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9002), &[902], 8)],
+        ));
+        assert_eq!(
+            sim.state.index.counters.parentless_stores, 0,
+            "a tail entry is not a parent-less store"
+        );
+        assert_eq!(sim.state.index.counters.parentless_blocks, 0);
+        assert_eq!(
+            (
+                sim.state.index.counters.sub_block_stores,
+                sim.state.index.counters.sub_block_blocks
+            ),
+            (2, 2),
+            "the two entries are counted as sub-block stores"
+        );
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the full blocks only"
+        );
+        // The eviction of each block lists the entry beside the full hash.
+        sim.deliver(&batch(4, None, vec![removed(&[14, 901])]));
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the second copy of the full block stands"
+        );
+        sim.deliver(&batch(5, None, vec![removed(&[14, 902])]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        sim.assert_matches_reference();
     }
 }
