@@ -146,12 +146,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the recorded template run keeps or drops the role: one case of every such model",
     ),
     (
-        "*/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12): one \
-         case of every model",
-    ),
-    (
         "*/render/tools-history-content-and-call",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the templates that write the string as recorded render otherwise: one \
