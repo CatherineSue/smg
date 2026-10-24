@@ -1005,6 +1005,7 @@ impl StreamingProcessor {
             ttft: first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
+            cached_tokens: None,
             output_tokens: total_completion as u64,
         });
     }
@@ -2004,6 +2005,7 @@ impl StreamingProcessor {
                         ttft: first_token_time.map(|t| t.duration_since(start_time)),
                         generation_duration: start_time.elapsed(),
                         input_tokens: Some(total_prompt as u64),
+                        cached_tokens: Some(u64::from(total_cached)),
                         output_tokens: total_completion as u64,
                     });
                 }
@@ -3513,6 +3515,7 @@ impl<'a> ChatStream<'a> {
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
+            cached_tokens: Some(u64::from(counts.cached)),
             output_tokens: total_completion as u64,
         });
     }
@@ -4601,6 +4604,7 @@ impl<'a> MessagesStream<'a> {
                 .map(|t| t.duration_since(self.start_time)),
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
+            cached_tokens: Some(u64::from(self.cached_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
         });
     }
