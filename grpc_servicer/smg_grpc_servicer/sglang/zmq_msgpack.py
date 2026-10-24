@@ -45,6 +45,7 @@ import msgspec
 import zmq
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
 
 if TYPE_CHECKING:
@@ -203,6 +204,13 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     # grammar's rejection of a sampled token with `GRAMMAR_REJECTED_ERR_TYPE`,
     # see `zmq_plugin`); None for other finishes.
     finished_err_types: list[str | None] | None = None
+    # Hidden states when the request asked for them (`return_hidden_states`):
+    # per request, the final-layer rows this output ADDED (the prefill block
+    # once, flattened from the engine's element, then a decode step's rows; the
+    # engine keeps the list cumulative, `HiddenStateRows` sends what is new);
+    # the frontends accumulate. None for a request that did not ask, or a
+    # scheduler that captured none.
+    output_hidden_states: list[list[list[float]] | None] | None = None
 
     @classmethod
     def from_full(
@@ -214,6 +222,7 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
         num_waiting: int = 0,
         kv_used_tokens: int = 0,
         kv_total_tokens: int = 0,
+        hidden_rows: list[list[list[float]] | None] | None = None,
     ) -> BatchTokenIDSlimOutput:
         if out.output_ids is None:
             raise ValueError("BatchTokenIDOutput.output_ids is required on the slim wire")
@@ -294,7 +303,53 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
                 for v in column(getattr(out, "output_token_ids_logprobs_idx", None), None)
             ],
             finished_err_types=[err_type(r) for r in reasons],
+            # The rows each request's hidden states ADD with this output
+            # (`HiddenStateRows.column`): the engine keeps them cumulative, the
+            # wire carries what is new. None per request without rows.
+            output_hidden_states=column(hidden_rows, None),
         )
+
+
+class HiddenStateRows:
+    """The hidden-state rows each output adds per request, for the wire.
+
+    The engine keeps a request's rows cumulative (``req.hidden_states``: the
+    prefill's block, then a decode step's rows), so relaying the list as
+    it stands would re-encode and re-send the prompt's block on every decode
+    step. This side remembers how many of the list's elements it consumed per
+    rid (the prefill block is one element, a decode step adds one or more:
+    several under speculative decoding) and reshapes
+    only the rest, O(new rows) per step; a finished or aborted request is
+    forgotten.
+    """
+
+    def __init__(self) -> None:
+        self._consumed: dict[str, int] = {}
+
+    def column(self, out: Any) -> list[list[list[float]] | None] | None:
+        """The slim column for ``out``: per request the rows new since the
+        last output (``None`` for a request without hidden states), or None
+        when no request of the batch carries any."""
+        values = getattr(out, "output_hidden_states", None)
+        rids = list(getattr(out, "rids", None) or [])
+        finished = list(getattr(out, "finished_reasons", None) or [])
+        column: list[list[list[float]] | None] | None = None
+        if values:
+            column = []
+            for i, rid in enumerate(rids):
+                value = values[i] if i < len(values) else None
+                if value is None:
+                    column.append(None)
+                    continue
+                fresh, self._consumed[rid] = new_hidden_rows(value, self._consumed.get(rid, 0))
+                column.append(fresh)
+        for i, rid in enumerate(rids):
+            if i < len(finished) and finished[i]:
+                self._consumed.pop(rid, None)
+        return column
+
+    def forget(self, rid: str) -> None:
+        self._consumed.pop(rid, None)
 
 
 def _finish_columns(reasons: list) -> tuple[list[str], list[str | None], list[int | None]]:
@@ -600,6 +655,9 @@ class MsgpackSendSocket:
         # The traces of the requests in flight (started by the receiver from
         # the caller's context, ended here on the terminal output).
         self.traces = RequestTraces()
+        # The elements of each request's cumulative hidden-state list already
+        # consumed (the wire carries each output's new rows).
+        self.hidden_rows = HiddenStateRows()
 
     def attach(
         self,
@@ -699,7 +757,10 @@ class MsgpackSendSocket:
         if isinstance(output, BatchTokenIDOutput):
             self._send_slim(
                 BatchTokenIDSlimOutput.from_full(
-                    output, engine_index=self.engine_index, **self._load_tail()
+                    output,
+                    engine_index=self.engine_index,
+                    hidden_rows=self.hidden_rows.column(output),
+                    **self._load_tail(),
                 )
             )
             self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
@@ -760,6 +821,7 @@ class MsgpackSendSocket:
             )
         )
         self.traces.finish(rid)
+        self.hidden_rows.forget(rid)
 
     def send_engine_dead(self) -> None:
         """Best-effort ENGINE_CORE_DEAD on shutdown or crash; never raises."""

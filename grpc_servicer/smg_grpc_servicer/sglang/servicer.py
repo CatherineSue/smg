@@ -50,6 +50,10 @@ from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.hidden_states import (
+    refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
+)
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
     convert_loads_to_protobuf,
@@ -975,6 +979,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
+            refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,

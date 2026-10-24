@@ -16,10 +16,11 @@ msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
 the two implementations apart.
 
 What the msgpack wire does not carry, the Rust path reports rather than
-emulates: ``Embed``, ``FlushCache``, profiling, LoRA loading and the KV-event
-relay answer UNIMPLEMENTED, prompt logprobs, hidden states and multimodal
-inputs are refused, and PD/EPD disaggregation stays with the Python
-implementation.
+emulates: multimodal inputs are refused, PD/EPD disaggregation stays with the
+Python implementation, and LoRA loading answers UNIMPLEMENTED, as on the
+Python servicer; ``Embed``, ``FlushCache``, profiling, the KV-event relay,
+prompt logprobs and hidden states are served (hidden states on this path
+only: the Python servicer refuses them by name).
 """
 
 from __future__ import annotations

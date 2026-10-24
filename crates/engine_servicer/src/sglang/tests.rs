@@ -1374,6 +1374,187 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Hidden states ride the appended slim column as the rows each tick adds:
+/// each chunk carries them flattened (the prefill block on the first, a decode
+/// step's rows on each later one); the `Complete` one entry per position a
+/// forward ran on (the prompt positions the prefill computed, then each
+/// generated token fed back; the last sampled token has none), the final
+/// layer, the positions absolute (a prefix the radix cache served has no
+/// rows: the anchor comes from the scheduler's counters); a request that did
+/// not ask carries none.
+#[tokio::test]
+async fn hidden_states_pass_through_as_tick_rows_and_positions() {
+    let mut model = model_info();
+    model.server_args_json = r#"{"return_hidden_states_mode":"full"}"#.to_string();
+    let mut h = harness(model).await;
+    let request = sg::GenerateRequest {
+        return_hidden_states: true,
+        ..generate_request("h1", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    let sent = recv_add(&mut h.engine_in).await;
+    assert!(sent.return_hidden_states);
+    // The prefill block: one row per prompt position (three), hidden size 2.
+    // The first token is sampled from the last of them, so the prefill's tick
+    // carries no row of its own.
+    let mut rows = vec![vec![0.5, -0.5], vec![0.25, 0.75], vec![1.0, 0.0]];
+    let first = BatchTokenIDSlimOutput {
+        output_hidden_states: vec![Some(rows.clone())],
+        ..batch("h1", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk1.hidden_states, vec![0.5, -0.5, 0.25, 0.75, 1.0, 0.0]);
+    // The decode step that samples the second token fed the first one back:
+    // its row, the only one this tick adds, and the request's last
+    // (prompt + generated - 1 = 4).
+    rows.push(vec![3.0, 4.0]);
+    let last = BatchTokenIDSlimOutput {
+        output_hidden_states: vec![Some(vec![vec![3.0, 4.0]])],
+        ..batch("h1", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk2.hidden_states, vec![3.0, 4.0], "the tick's row only");
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.output_ids, vec![10, 11]);
+    assert_eq!(done.all_hidden_states.len(), rows.len());
+    for (position, (entry, row)) in done.all_hidden_states.iter().zip(&rows).enumerate() {
+        assert_eq!(entry.values, *row);
+        assert_eq!(entry.layer, -1, "the final hidden layer");
+        assert_eq!(entry.position, i32::try_from(position).unwrap());
+    }
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // A prefix the radix cache served has no rows: the prefill block holds the
+    // computed positions only, and the positions stay absolute, anchored from
+    // the scheduler's counters (a prompt of five, three of them cached, two
+    // generated: rows at 3, 4 and 5).
+    let request = sg::GenerateRequest {
+        return_hidden_states: true,
+        ..generate_request("h2", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    recv_add(&mut h.engine_in).await;
+    let first = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![5.0, 5.5], vec![6.0, 6.5]])],
+        ..batch("h2", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk1.hidden_states, vec![5.0, 5.5, 6.0, 6.5]);
+    let last = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![7.0, 7.5]])],
+        ..batch("h2", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk2.hidden_states, vec![7.0, 7.5]);
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        done.all_hidden_states
+            .iter()
+            .map(|entry| entry.position)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert_eq!(done.all_hidden_states[2].values, vec![7.0, 7.5]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // Without the flag nothing is asked and nothing rides the responses.
+    let mut stream = h
+        .client
+        .generate(generate_request("h2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!recv_add(&mut h.engine_in).await.return_hidden_states);
+    send(
+        &mut h.engine_out,
+        &batch("h2", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert!(chunk1.hidden_states.is_empty());
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(done.all_hidden_states.is_empty());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `return_hidden_states` is kept to the scheduler's launch-time cap ahead of
+/// the scheduler, with the engine frontend's own words: refused under
+/// `--return-hidden-states-mode last` or none, forwarded under `full` (the
+/// earlier `--enable-return-hidden-states` included) and when the launcher's
+/// server args name no cap at all.
+#[tokio::test]
+async fn hidden_states_are_kept_to_the_schedulers_launch_time_cap() {
+    for (args, words) in [
+        (
+            r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":false}"#,
+            "exceeds the server maximum `last`",
+        ),
+        (
+            // The engine's order: `last` wins over the legacy flag it sets itself.
+            r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":true}"#,
+            "exceeds the server maximum `last`",
+        ),
+        (
+            r#"{"return_hidden_states_mode":null,"enable_return_hidden_states":false}"#,
+            "not configured to return hidden states",
+        ),
+    ] {
+        let mut model = model_info();
+        model.server_args_json = args.to_string();
+        let mut h = harness(model).await;
+        let request = sg::GenerateRequest {
+            return_hidden_states: true,
+            ..generate_request("c1", false, Vec::new())
+        };
+        let refused = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(
+            refused.message().contains(words)
+                && refused
+                    .message()
+                    .contains("`--return-hidden-states-mode full`"),
+            "{}",
+            refused.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+    for args in [
+        r#"{"return_hidden_states_mode":"full","enable_return_hidden_states":false}"#,
+        r#"{"return_hidden_states_mode":null,"enable_return_hidden_states":true}"#,
+        r#"{"tp_size":1}"#,
+    ] {
+        let mut model = model_info();
+        model.server_args_json = args.to_string();
+        let mut h = harness(model).await;
+        let request = sg::GenerateRequest {
+            return_hidden_states: true,
+            ..generate_request("c2", false, Vec::new())
+        };
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        assert!(
+            recv_add(&mut h.engine_in).await.return_hidden_states,
+            "{args}"
+        );
+        send(
+            &mut h.engine_out,
+            &batch("c2", vec![10], 1, Some("stop"), None),
+        )
+        .await;
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.output_ids, vec![10]);
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
+
 /// With a publisher configured, `SubscribeKvEvents` relays it: the call
 /// resolves before any event, batches arrive under the publisher's sequence
 /// numbers, and stopping the servicer closes the subscription.
