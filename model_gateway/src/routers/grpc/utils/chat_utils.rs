@@ -866,7 +866,14 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .native_assistant_continuation;
 
         let params = ChatTemplateParams {
-            add_generation_prompt: !native_continuation,
+            // A continued final message decides its header by the renderer
+            // (none natively, the emulation's otherwise); any other request's
+            // header is its own `add_generation_prompt`, `true` when absent.
+            add_generation_prompt: if continues_final_assistant {
+                !native_continuation
+            } else {
+                request.adds_generation_prompt()
+            },
             continue_final_message: native_continuation,
             tools: prepared_tools.as_deref().map(PreparedTools::tools),
             prepared_tools: prepared_tools.as_deref(),
@@ -887,6 +894,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                         text: String::new(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
+                        generation_prompt: false,
                     },
                     PromptEncoding::FromText,
                 ));
@@ -917,6 +925,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))
