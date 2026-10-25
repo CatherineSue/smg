@@ -224,7 +224,7 @@ fn batch(
             ..Default::default()
         }],
         finished_requests: finish.map(|_| BTreeSet::from([request_id.to_string()])),
-        scheduler_stats: stats.map(Box::new),
+        scheduler_stats: stats,
         ..Default::default()
     })
 }
@@ -1568,11 +1568,11 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
         rank1_out
             .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 1,
-                scheduler_stats: Some(Box::new(SchedulerStats {
+                scheduler_stats: Some(SchedulerStats {
                     num_waiting_reqs: runnable,
                     num_skipped_waiting_reqs: deferred,
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }))
             .await
@@ -1639,7 +1639,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
                 }),
                 ..Default::default()
             }],
-            scheduler_stats: Some(Box::new(step(1))),
+            scheduler_stats: Some(step(1)),
             ..Default::default()
         }))
         .await
@@ -1656,7 +1656,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
-            scheduler_stats: Some(Box::new(step(0))),
+            scheduler_stats: Some(step(0)),
             ..Default::default()
         }))
         .await
