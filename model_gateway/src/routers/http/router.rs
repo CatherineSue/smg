@@ -101,8 +101,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType,
+        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
 };
 
@@ -265,8 +265,10 @@ impl Router {
                     }
                     Err(e) => {
                         error!(
-                            worker = worker.url(),
-                            endpoint, "Failed to proxy GET request: {e}"
+                            worker = Endpoint::redacted_str(worker.url()),
+                            endpoint,
+                            "Failed to proxy GET request: {}",
+                            cause(&e)
                         );
                         convert_reqwest_error(e)
                     }
@@ -861,8 +863,10 @@ impl Router {
                         .await
                         .map_err(|e| {
                             error!(
-                                worker = worker.url(),
-                                endpoint, "Failed to send request: {e}"
+                                worker = Endpoint::redacted_str(worker.url()),
+                                endpoint,
+                                "Failed to send request: {}",
+                                cause(&e)
                             );
                             convert_reqwest_error(e)
                         })
@@ -1090,9 +1094,9 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
                 let err_resp = convert_reqwest_error(e);
                 outcome.send_failure(worker.as_ref(), &err_resp);
@@ -1195,9 +1199,9 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
 
                 return convert_reqwest_error(e);
@@ -1377,9 +1381,9 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send streamed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
                 return convert_reqwest_error(e);
             }
@@ -2713,6 +2717,82 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_status(openai_protocol::worker::WorkerStatus::NotReady);
         router
+    }
+
+    /// The complete text of every event written on this thread's subscriber:
+    /// the message and the fields, as a reader of the log sees them.
+    #[derive(Clone, Default)]
+    struct EventTexts(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventTexts {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            self.0.lock().unwrap().push(text.0);
+        }
+    }
+
+    /// A failed call to a worker is logged log-safe as a whole: a worker
+    /// registered with userinfo at a port nobody listens on fails the proxied
+    /// GET, and the complete event (the message and every field) carries the
+    /// user and the mask, never the secret. The error's own text goes through
+    /// `cause`, so the line names no address of its own either, whatever the
+    /// HTTP client puts in its `Display`.
+    #[tokio::test]
+    async fn a_failed_call_to_a_worker_with_userinfo_is_logged_log_safe() {
+        let texts = EventTexts::default();
+        let _subscriber = test_subscriber(texts.clone());
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://alice:s3cret@127.0.0.1:{port}"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "health")
+            .await;
+
+        assert!(response.status().is_server_error(), "{}", response.status());
+        let texts = texts.0.lock().unwrap();
+        let line = texts
+            .iter()
+            .find(|text| text.contains("Failed to proxy GET request"))
+            .expect("the failure line");
+        assert!(
+            line.contains(&format!("alice:***@127.0.0.1:{port}")),
+            "{line}"
+        );
+        assert!(!line.contains("s3cret"), "{line}");
+        assert!(
+            texts.iter().all(|text| !text.contains("s3cret")),
+            "{texts:?}"
+        );
     }
 
     /// smg-lab #288: the `model` label of the request families is bounded by
