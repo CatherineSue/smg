@@ -24,11 +24,18 @@ pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 /// Request types are single-byte protocol constants sent as a raw ZMQ frame
 /// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`),
 /// so the receiver can dispatch without decoding first.
+/// The wire's full set: add 0, abort 1, control 2 (the scheduler's control
+/// call), encode 3 (a disaggregated encode worker's request, its own change).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenSpeedRequestType {
     Add = 0,
     Abort = 1,
+    /// A control call for a scheduler of the control-wire revision:
+    /// `(call_id, method, args)`, answered by a `ControlReplySlim` under the
+    /// same call id on the output socket. Sent only to a scheduler whose
+    /// handshake declared that reply.
+    Control = 2,
 }
 
 impl TokenSpeedRequestType {
@@ -40,6 +47,7 @@ impl TokenSpeedRequestType {
         match value {
             0 => Some(Self::Add),
             1 => Some(Self::Abort),
+            2 => Some(Self::Control),
             _ => None,
         }
     }
@@ -49,6 +57,7 @@ impl TokenSpeedRequestType {
         Bytes::from_static(match self {
             Self::Add => b"\x00",
             Self::Abort => b"\x01",
+            Self::Control => b"\x02",
         })
     }
 }
