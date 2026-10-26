@@ -416,6 +416,7 @@ mod tests {
             kv_total_pages: 400,
             finished_status_codes: Vec::new(),
             finished_messages: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -691,6 +692,7 @@ mod tests {
             SlimOutputLayout {
                 finish_status: Some(13),
                 finish_message: Some(14),
+                ..Default::default()
             }
         );
 
