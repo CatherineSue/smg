@@ -1583,35 +1583,24 @@ impl ExecutionResult {
     }
 
     /// Every stream of the result under the request's `deadline` (see
-    /// [`ProtoStream::with_deadline`]): the one worker's, both sides of a
+    /// [`ProtoStream::apply_deadline`]), in place: the one worker's, both sides of a
     /// disaggregated pair, each result of a batch. An embedding is one
     /// answer, already in hand.
-    #[must_use]
-    pub(crate) fn with_deadline(self, deadline: RequestDeadline) -> Self {
+    pub(crate) fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
-            Self::Single { stream } => Self::Single {
-                stream: stream.with_deadline(deadline),
-            },
+            Self::Single { stream } => stream.apply_deadline(deadline),
             Self::PrefillDecode {
-                prefill,
-                decode,
-                prefill_guards,
-                pd_timing,
-                prefill_input_logprobs,
-            } => Self::PrefillDecode {
-                prefill: prefill.with_deadline(deadline),
-                decode: Box::new(decode.with_deadline(deadline)),
-                prefill_guards,
-                pd_timing,
-                prefill_input_logprobs,
-            },
-            Self::Embedding { .. } => self,
-            Self::Batch { results } => Self::Batch {
-                results: results
-                    .into_iter()
-                    .map(|result| result.with_deadline(deadline))
-                    .collect(),
-            },
+                prefill, decode, ..
+            } => {
+                prefill.apply_deadline(deadline);
+                decode.apply_deadline(deadline);
+            }
+            Self::Embedding { .. } => {}
+            Self::Batch { results } => {
+                for result in results {
+                    result.apply_deadline(deadline);
+                }
+            }
         }
     }
 }
