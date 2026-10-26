@@ -493,6 +493,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
     health_check_endpoint: String,
     health_check_interval_secs: u64,
@@ -1133,6 +1134,7 @@ impl Router {
             .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .grpc_request_timeout_secs(self.grpc_request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -1370,6 +1372,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
         health_check_interval_secs = 60,
@@ -1591,6 +1594,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
         health_check_endpoint: String,
         health_check_interval_secs: u64,
@@ -1848,6 +1852,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grpc_request_timeout_secs,
             header_read_timeout_secs,
             health_check_endpoint,
             health_check_interval_secs,
