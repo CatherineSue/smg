@@ -1715,11 +1715,117 @@ async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
     assert!(with_text >= 2, "{events:?}");
 }
 
-/// A unary response's logprobs cover its content's tokens, as the content
-/// deltas of a stream do: not the reasoning, its delimiters, or the tokens
-/// after a stop sequence.
+/// For each event of choice 0 that carries logprobs: what its delta carries
+/// (`reasoning`, `content`, `tool_calls` or `empty`) and the tokens of the
+/// entries, joined.
+pub(super) fn logprob_carriers(events: &[Value]) -> Vec<(&'static str, String)> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let choice = &event["choices"][0];
+            let items = choice["logprobs"]["content"].as_array()?;
+            let delta = &choice["delta"];
+            let kind = if delta["reasoning_content"].is_string() {
+                "reasoning"
+            } else if delta["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+            {
+                "content"
+            } else if delta["tool_calls"].is_array() {
+                "tool_calls"
+            } else {
+                "empty"
+            };
+            let tokens = items
+                .iter()
+                .filter_map(|item| item["token"].as_str())
+                .collect();
+            Some((kind, tokens))
+        })
+        .collect()
+}
+
+/// A chunk whose text makes no delta (the thinking opener alone, which the
+/// reasoning parser consumes) still carries its logprobs, on a chunk with an
+/// empty delta, as the engine's own server sends a step whose text made
+/// none: the stream carries every generated token's entry once, in order.
 #[tokio::test]
-async fn chat_unary_logprobs_cover_the_content_only() {
+async fn chat_stream_carries_a_held_chunks_logprobs_on_an_empty_delta() {
+    let (result, events) = chat_events(
+        vec![
+            chunk_with_logprobs(0, "<think>"),
+            chunk_with_logprobs(0, "why</think>ok"),
+            complete(0, "stop"),
+        ],
+        false,
+        "0",
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "why");
+    assert_eq!(chat_text(&events, 0, "content"), "ok");
+    assert_eq!(
+        logprob_carriers(&events),
+        [
+            ("empty", "<think>".to_string()),
+            ("content", "why</think>ok".to_string()),
+        ],
+        "{events:?}"
+    );
+}
+
+/// A chunk the tool parser turns into tool-call deltas carries its logprobs
+/// on the first of them, as a content chunk does on its content delta.
+#[tokio::test]
+async fn chat_stream_keeps_logprobs_on_tool_call_deltas() {
+    let frames = vec![
+        chunk_with_logprobs(0, "<think>why</think>"),
+        chunk_with_logprobs(0, TWO_CALLS[0]),
+        complete(0, "stop"),
+    ];
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let (tx, rx) = sse_channel();
+    let processor = streaming_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        Some("qwen".to_string()),
+        Some("qwen3".to_string()),
+    ));
+    let result = processor
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            chat_spec(true),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "why");
+    assert!(!delta_tool_calls(&events).is_empty(), "{events:?}");
+    assert_eq!(
+        logprob_carriers(&events),
+        [
+            ("reasoning", "<think>why</think>".to_string()),
+            ("tool_calls", TWO_CALLS[0].to_string()),
+        ],
+        "{events:?}"
+    );
+}
+
+/// A unary response's logprobs are the engine's: one entry per generated
+/// token in order, as the engine's own server returns them. The reasoning
+/// and its delimiters, the content, and the tokens past the stop sequence
+/// the gateway matched (generated and counted by the engine all the same)
+/// are in the list, as the engine counted them; a stream stops sending at the
+/// stop it matched, and each path matches its own `usage.completion_tokens`.
+#[tokio::test]
+async fn chat_unary_logprobs_cover_every_generated_token() {
     let text = "<think>why</think>okSTOPmore";
     let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
     let mut last = complete(0, "stop");
@@ -1755,18 +1861,72 @@ async fn chat_unary_logprobs_cover_the_content_only() {
     let choice = &serde_json::to_value(response).unwrap()["choices"][0];
     assert_eq!(choice["message"]["reasoning_content"], "why");
     assert_eq!(choice["message"]["content"], "ok");
-    let logprobs: Vec<(&str, f64)> = choice["logprobs"]["content"]
+    let logprobs: Vec<(String, f64)> = choice["logprobs"]["content"]
         .as_array()
         .unwrap()
         .iter()
         .map(|item| {
             (
-                item["token"].as_str().unwrap(),
+                item["token"].as_str().unwrap().to_string(),
                 item["logprob"].as_f64().unwrap(),
             )
         })
         .collect();
-    assert_eq!(logprobs, [("o", -18.0), ("k", -19.0)]);
+    let every_token: Vec<(String, f64)> = text
+        .chars()
+        .enumerate()
+        .map(|(i, character)| (character.to_string(), -(i as f64)))
+        .collect();
+    assert_eq!(logprobs, every_token);
+}
+
+/// A unary response of reasoning and a tool call, with no content, keeps the
+/// engine's whole list too (it kept none while the list was cut to the
+/// content's tokens).
+#[tokio::test]
+async fn chat_unary_logprobs_of_a_tool_call_answer_cover_every_generated_token() {
+    let text = "<think>why</think>{\"name\": \"lookup\", \"arguments\": {}}";
+    let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
+    let mut last = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+        complete.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: vec![-0.5; token_ids.len()],
+            token_ids: token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+        complete.output_ids = token_ids.clone();
+    }
+    let (stream, server) = scripted_stream(vec![last], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+    let (response, _) = unary_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        Some("json".to_string()),
+        Some("qwen3".to_string()),
+    ))
+    .process_non_streaming_chat_response(
+        context::ExecutionResult::Single { stream },
+        chat_spec(true),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+        false,
+    )
+    .await
+    .unwrap_or_else(|response| panic!("{}", response.status()));
+    server.abort();
+    let choice = &serde_json::to_value(response).unwrap()["choices"][0];
+    assert_eq!(choice["message"]["reasoning_content"], "why", "{choice}");
+    assert!(choice["message"]["content"].is_null(), "{choice}");
+    assert_eq!(
+        choice["message"]["tool_calls"][0]["function"]["name"], "lookup",
+        "{choice}"
+    );
+    assert_eq!(
+        choice["logprobs"]["content"].as_array().map(Vec::len),
+        Some(token_ids.len()),
+        "{choice}"
+    );
 }
 
 #[tokio::test]
