@@ -1577,7 +1577,9 @@ impl WorkerSelectionStage {
 
     /// The verdict for one disaggregated role, judged from the pool it
     /// selected over *before* the `is_available()` filter. The roles are
-    /// gRPC-only (no KV rendezvous on ZMQ), so a retry pins the runtime alone;
+    /// served over gRPC, or TokenSpeed's direct ZMQ, whose wire is the gRPC
+    /// pipeline's (see `RoutingPool::GrpcPrefill`), so a retry pins the
+    /// runtime alone;
     /// the regular role is judged by [`placement::single_failure`] instead.
     /// Failure path only.
     fn disaggregated_role_verdict(
@@ -1759,9 +1761,10 @@ impl WorkerSelectionStage {
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
         // Both pools derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
-        // that never coexisted. The pools are strictly gRPC (a ZMQ worker would
-        // silently drop the PD bootstrap info, see `RoutingPool::GrpcPrefill`;
-        // the wildcard model maps to the global snapshot). The pools must
+        // that never coexisted. The pools hold the workers whose wire carries
+        // the PD bootstrap info (gRPC, and TokenSpeed's direct ZMQ, see
+        // `RoutingPool::GrpcPrefill`; the wildcard model maps to the global
+        // snapshot). The pools must
         // share a runtime, the rendezvous being runtime-specific, and a retry
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
@@ -1894,10 +1897,11 @@ impl WorkerSelectionStage {
             ..
         } = inputs;
         // All three pools derive from ONE membership snapshot (see
-        // select_pd_pair). The pools are strictly gRPC — encode dispatch is
-        // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
-        // ZMQ wire carries no KV-transfer rendezvous for the prefill/decode
-        // pools; the wildcard model maps to the global snapshot. Availability
+        // select_pd_pair). The encode pool is strictly gRPC — encode
+        // dispatch is a gRPC encoder RPC the direct-ZMQ worker has no path
+        // for — and the prefill/decode pools hold the workers whose wire
+        // carries the KV-transfer rendezvous (see `RoutingPool::GrpcPrefill`);
+        // the wildcard model maps to the global snapshot. Availability
         // stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
@@ -2722,24 +2726,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn select_pd_pair_ignores_zmq_workers() {
-        // The ZMQ wire carries no KV-transfer rendezvous, so ZMQ prefill/decode
-        // workers must never be paired even if they reach the registry.
-        let model_id = "test-model-zmq";
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        for (port, worker_type) in [(9000, WorkerType::Prefill), (9100, WorkerType::Decode)] {
-            worker_registry
+    /// Register a ZMQ prefill and a ZMQ decode worker of `runtime` for
+    /// `model_id`, under ports `port` and `port + 100`.
+    fn register_zmq_pd_workers(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        runtime: RuntimeType,
+        port: u16,
+    ) -> (String, String) {
+        let url = |port: u16| format!("ipc:///tmp/smg-zmq/{port}.ipc");
+        for (port, worker_type) in [
+            (port, WorkerType::Prefill),
+            (port + 100, WorkerType::Decode),
+        ] {
+            registry
                 .register(Arc::new(
-                    BasicWorkerBuilder::new(format!("ipc:///tmp/smg-zmq/{port}.ipc"))
+                    BasicWorkerBuilder::new(url(port))
                         .model(ModelCard::new(model_id))
                         .worker_type(worker_type)
                         .connection_mode(ConnectionMode::Zmq)
+                        .runtime_type(runtime)
                         .health_config(no_health_check())
                         .build(),
                 ))
                 .unwrap();
         }
+        (url(port), url(port + 100))
+    }
+
+    #[test]
+    fn select_pd_pair_ignores_zmq_workers() {
+        // Only TokenSpeed's ZMQ wire carries the KV-transfer rendezvous, so
+        // another runtime's ZMQ prefill/decode workers must never be paired
+        // even if they reach the registry.
+        let model_id = "test-model-zmq";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::Sglang, 9000);
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         policy_registry
@@ -2779,6 +2801,39 @@ mod tests {
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
+    }
+
+    /// TokenSpeed's direct-ZMQ engines carry the rendezvous on their generate
+    /// request, so a ZMQ prefill and a ZMQ decode engine of TokenSpeed pair.
+    #[test]
+    fn select_pd_pair_pairs_tokenspeed_zmq_engines() {
+        let model_id = "test-model-tokenspeed-zmq";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_url, decode_url) =
+            register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::TokenSpeed, 9200);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+
+        let (prefill, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                PairDemands::default(),
+            )
+            .expect("a TokenSpeed ZMQ PD pair should be selected");
+        assert_eq!(prefill.url(), prefill_url);
+        assert_eq!(decode.url(), decode_url);
     }
 
     /// gRPC selection honors the conversation header across fresh request IDs.

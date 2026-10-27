@@ -2020,8 +2020,9 @@ mod tests {
 
     #[test]
     fn a_worker_on_a_transport_the_family_cannot_use_does_not_count() {
-        // A gRPC prefill worker and a ZMQ decode worker: the gRPC PD family
-        // selects from gRPC-only pools, so the fleet is not PD-ready and the
+        // A gRPC prefill worker and a ZMQ decode worker of a runtime whose
+        // ZMQ wire carries no rendezvous: the gRPC PD family's pools leave it
+        // out, so the fleet is not PD-ready and the
         // request must not be steered to a family that cannot select a pair.
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, connection) in [

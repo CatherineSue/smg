@@ -2638,9 +2638,10 @@ class RouterArgs:
             type=int,
             default=RouterArgs.zmq_engine_count,
             help=(
-                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
-                "grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM and TokenSpeed; default: 1)"
+                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
+                "a grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM and TokenSpeed; default: as many as the first "
+                "engine to dial declares, one for an engine that declares none)"
             ),
         )
         backend_group.add_argument(

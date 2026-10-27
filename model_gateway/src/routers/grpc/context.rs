@@ -54,9 +54,7 @@ use crate::{
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{
-        ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-    },
+    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -337,10 +335,15 @@ impl WireConstraint {
                 requires_media_refs,
                 pipeline,
             },
-            // Disaggregated workers are gRPC-only.
-            WorkerSelection::Disaggregated { runtime_type, .. } => Self {
+            // The prefill side builds the request, so its transport is the
+            // plan's (a gRPC servicer, or a TokenSpeed engine's ZMQ wire).
+            WorkerSelection::Disaggregated {
+                prefill,
+                runtime_type,
+                ..
+            } => Self {
                 runtime: *runtime_type,
-                connection: ConnectionMode::Grpc,
+                connection: *prefill.connection_mode(),
                 requires_media_refs,
                 pipeline,
             },

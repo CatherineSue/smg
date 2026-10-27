@@ -2,10 +2,10 @@
 //!
 //! Worker addresses arrive in several spellings for the same backend: bare
 //! `host:port` from discovery, `http://`/`grpc://` forms from configuration
-//! and the admin API, `ipc://` paths for ZMQ, and a `@rank` suffix that the
-//! registration workflow appends when it expands a data-parallel worker. Before
-//! this module each consumer stripped what it cared about with its own ad-hoc
-//! string handling, and those implementations disagreed — notably on `@` inside
+//! and the admin API, `ipc://` paths and `tcp://` addresses for ZMQ, and a
+//! `@rank` suffix that the registration workflow appends when it expands a
+//! data-parallel worker. Before this module each consumer stripped what it
+//! cared about with its own ad-hoc string handling, and those implementations disagreed — notably on `@` inside
 //! an IPC path or an address such as `http://user@worker:3000`, and on
 //! uppercase schemes.
 //!
@@ -33,6 +33,8 @@ pub enum Scheme {
     Grpc,
     Grpcs,
     Ipc,
+    /// A ZMQ worker whose engines dial from other hosts.
+    Tcp,
 }
 
 impl Scheme {
@@ -44,17 +46,19 @@ impl Scheme {
             Scheme::Grpc => "grpc://",
             Scheme::Grpcs => "grpcs://",
             Scheme::Ipc => "ipc://",
+            Scheme::Tcp => "tcp://",
         }
     }
 
     /// Match a scheme prefix case-insensitively, returning it and the rest.
     fn split_from(input: &str) -> Option<(Scheme, &str)> {
-        const SCHEMES: [Scheme; 5] = [
+        const SCHEMES: [Scheme; 6] = [
             Scheme::Http,
             Scheme::Https,
             Scheme::Grpc,
             Scheme::Grpcs,
             Scheme::Ipc,
+            Scheme::Tcp,
         ];
         SCHEMES.into_iter().find_map(|scheme| {
             let prefix = scheme.as_prefix();
@@ -553,6 +557,18 @@ mod tests {
         assert_eq!(key_of("ipc:///tmp/a@b.sock"), "/tmp/a@b.sock");
         // A scheme-less query reaches an IPC registration, as it always has.
         assert_eq!(key_of("ipc://worker:3000"), key_of("worker:3000"));
+    }
+
+    /// A ZMQ worker served over TCP is a host and port like any network
+    /// address, and renders back with its scheme.
+    #[test]
+    fn a_tcp_zmq_address_is_a_host_and_port() {
+        let endpoint = Endpoint::parse("tcp://10.0.0.5:31000").unwrap();
+        assert_eq!(endpoint.scheme(), Some(Scheme::Tcp));
+        assert_eq!(endpoint.port(), Some(31000));
+        assert!(!endpoint.is_ipc());
+        assert_eq!(endpoint.key().as_str(), "10.0.0.5:31000");
+        assert_eq!(endpoint.render(), "tcp://10.0.0.5:31000");
     }
 
     #[test]

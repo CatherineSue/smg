@@ -1098,25 +1098,95 @@ fn global_snapshot_never_publishes_a_torn_generation() {
 #[test]
 fn routing_pools_filter_regular_workers_by_transport() {
     let registry = WorkerRegistry::new();
+    let (sglang, tokenspeed) = (RuntimeType::Sglang, RuntimeType::TokenSpeed);
     let workers = [
-        ("http://regular", WorkerType::Regular, ConnectionMode::Http),
-        ("grpc://regular", WorkerType::Regular, ConnectionMode::Grpc),
-        ("zmq://regular", WorkerType::Regular, ConnectionMode::Zmq),
-        ("http://prefill", WorkerType::Prefill, ConnectionMode::Http),
-        ("grpc://prefill", WorkerType::Prefill, ConnectionMode::Grpc),
-        ("zmq://prefill", WorkerType::Prefill, ConnectionMode::Zmq),
-        ("http://decode", WorkerType::Decode, ConnectionMode::Http),
-        ("grpc://decode", WorkerType::Decode, ConnectionMode::Grpc),
-        ("grpc://encode", WorkerType::Encode, ConnectionMode::Grpc),
-        ("http://encode", WorkerType::Encode, ConnectionMode::Http),
+        (
+            "http://regular",
+            WorkerType::Regular,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://regular",
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://regular",
+            WorkerType::Regular,
+            ConnectionMode::Zmq,
+            sglang,
+        ),
+        (
+            "http://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Zmq,
+            sglang,
+        ),
+        (
+            "zmq://ts-prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
+        (
+            "http://decode",
+            WorkerType::Decode,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://decode",
+            WorkerType::Decode,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://ts-decode",
+            WorkerType::Decode,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
+        (
+            "grpc://encode",
+            WorkerType::Encode,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "http://encode",
+            WorkerType::Encode,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "zmq://ts-encode",
+            WorkerType::Encode,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
     ];
-    for (url, worker_type, connection_mode) in workers {
+    for (url, worker_type, connection_mode, runtime_type) in workers {
         registry
             .register(Arc::new(
                 BasicWorkerBuilder::new(url)
                     .model(ModelCard::new("model"))
                     .worker_type(worker_type)
                     .connection_mode(connection_mode)
+                    .runtime_type(runtime_type)
                     .health_config(no_health_check())
                     .build(),
             ))
@@ -1139,19 +1209,21 @@ fn routing_pools_filter_regular_workers_by_transport() {
         urls(RoutingPool::GrpcPipelineRegular),
         HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
     );
-    // PD/EPD pools are strictly gRPC: a ZMQ prefill worker that slipped
-    // past registration must not appear.
+    // The disaggregated pools hold gRPC workers and TokenSpeed's direct-ZMQ
+    // engines, whose wire carries the rendezvous and the encode request:
+    // another runtime's ZMQ prefill worker that slipped past registration
+    // must not appear.
     assert_eq!(
         urls(RoutingPool::GrpcPrefill),
-        HashSet::from(["grpc://prefill".to_string()])
+        HashSet::from(["grpc://prefill".to_string(), "zmq://ts-prefill".to_string()])
     );
     assert_eq!(
         urls(RoutingPool::GrpcDecode),
-        HashSet::from(["grpc://decode".to_string()])
+        HashSet::from(["grpc://decode".to_string(), "zmq://ts-decode".to_string()])
     );
     assert_eq!(
         urls(RoutingPool::GrpcEncode),
-        HashSet::from(["grpc://encode".to_string()])
+        HashSet::from(["grpc://encode".to_string(), "zmq://ts-encode".to_string()])
     );
     // The HTTP PD pools are HTTP-only: the router proxies plain HTTP to
     // the selected URL, so gRPC and ZMQ workers must never be selectable.

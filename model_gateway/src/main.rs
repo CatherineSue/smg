@@ -300,8 +300,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
-    /// worker whose handshake awaits this many engines on one socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
+    /// grouped worker whose handshake awaits this many engines on one socket set
+    /// (default: as many as the first engine to dial declares, one for an
+    /// engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 

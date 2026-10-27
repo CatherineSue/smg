@@ -492,15 +492,17 @@ mod tests {
         assert_eq!(worker.metadata().spec.url, "ipc:///tmp/w.ipc");
         assert_eq!(worker.metadata().spec.dp_size, Some(4));
         assert_eq!(worker.metadata().spec.dp_rank, None);
-        assert_eq!(worker.metadata().zmq_engine_count(), 4);
+        assert_eq!(worker.metadata().zmq_engine_count(), Some(4));
     }
 
     #[test]
-    fn ungrouped_worker_awaits_one_engine() {
+    fn ungrouped_worker_awaits_the_engines_it_is_dialed_by() {
+        // No count: the handshake awaits the group the first engine declares
+        // (one engine for an engine that declares none).
         let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
             .connection_mode(ConnectionMode::Zmq)
             .build();
-        assert_eq!(worker.metadata().zmq_engine_count(), 1);
+        assert_eq!(worker.metadata().zmq_engine_count(), None);
     }
 
     #[test]

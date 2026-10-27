@@ -1864,7 +1864,7 @@ mod tests {
             new.metadata().spec.zmq_handshake_address.as_deref(),
             Some(handshake.as_str())
         );
-        assert_eq!(new.metadata().zmq_engine_count(), 2);
+        assert_eq!(new.metadata().zmq_engine_count(), Some(2));
         // The overload block survives a metadata-only update, and so does the
         // effective threshold resolved from it.
         assert_eq!(new.metadata().spec.overload.waiting_requests, Some(8));

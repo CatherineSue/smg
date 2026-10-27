@@ -996,15 +996,40 @@ pub(crate) fn finish_generate_request(
     Ok(())
 }
 
-/// Inject the KV bootstrap host/port/room into a generate request.
+/// A disaggregated worker's bootstrap rendezvous `(host, port)` (a prefill
+/// worker's KV, an encode worker's embeddings): the operator's
+/// (its URL's host, the port given with it) where set, else what its engine
+/// declared at the handshake (a direct-ZMQ worker's URL names the gateway's
+/// own bind, not the engine's host), else the default port.
+pub(crate) fn bootstrap_rendezvous<'a>(
+    registered_host: &'a str,
+    registered_port: Option<u16>,
+    declared: Option<&'a (String, u16)>,
+) -> (&'a str, u16) {
+    let host = match registered_host {
+        "" => declared.map_or("", |(host, _)| host.as_str()),
+        host => host,
+    };
+    let port = registered_port
+        .or_else(|| declared.map(|&(_, port)| port))
+        .unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    (host, port)
+}
+
+/// Inject the KV bootstrap host/port/room into a generate request, at the
+/// prefill worker's [`bootstrap_rendezvous`].
 fn inject_kv_bootstrap_room(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let hostname = metadata.bootstrap_host();
-    let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    let declared = prefill_worker.declared_bootstrap();
+    let (hostname, bootstrap_port) = bootstrap_rendezvous(
+        metadata.bootstrap_host(),
+        metadata.bootstrap_port(),
+        declared.as_ref(),
+    );
     // 63-bit room: no dedup, keep the space wide so the birthday collision
     // rate stays negligible. See the proto field doc.
     //
@@ -1034,6 +1059,38 @@ fn inject_kv_bootstrap_room(
         "Injected PD rendezvous: host={}, port={}, room={}",
         hostname, bootstrap_port, room_id
     );
+}
+
+#[cfg(test)]
+mod bootstrap_rendezvous_tests {
+    use super::*;
+
+    /// What the operator registered wins, field by field; what the engine
+    /// declared fills the rest; the default port is the last resort.
+    #[test]
+    fn the_operators_rendezvous_wins_and_the_engines_fills_the_rest() {
+        let declared = ("10.0.0.7".to_string(), 31755);
+        assert_eq!(
+            bootstrap_rendezvous("", None, Some(&declared)),
+            ("10.0.0.7", 31755)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", Some(9000), Some(&declared)),
+            ("prefill-0", 9000)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", None, Some(&declared)),
+            ("prefill-0", 31755)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("", Some(9000), Some(&declared)),
+            ("10.0.0.7", 9000)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", None, None),
+            ("prefill-0", DEFAULT_BOOTSTRAP_PORT)
+        );
+    }
 }
 
 #[cfg(test)]

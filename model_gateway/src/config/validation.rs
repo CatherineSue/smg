@@ -208,7 +208,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // matches schemes case-sensitively, so a mixed-case scheme would be
     // rewritten downstream and diverge from the reservation key — the
     // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc", "tcp"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
     // A refusal names the address through the gateway's masking: it is
     // written to stderr at start-up and answered to the API caller, and
@@ -222,8 +222,8 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
         let rule =
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
-                    scheme";
+            "URL must start with a lowercase http://, https://, grpc://, grpcs://, ipc://, or \
+             tcp:// scheme";
         let is_a_scheme = !scheme.is_empty()
             && scheme
                 .chars()
@@ -3284,6 +3284,8 @@ mod tests {
             "https://worker.example.com",
             "grpc://10.0.0.5:50051",
             "grpcs://worker.example.com:443",
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            "tcp://10.0.0.5:31000",
         ] {
             assert!(validate_worker_url(url).is_ok(), "expected {url} to pass");
         }

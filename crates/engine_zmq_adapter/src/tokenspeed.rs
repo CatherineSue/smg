@@ -7,6 +7,7 @@ use engine_zmq_client::{
     codec::tensor::{checked_numel, WireTensor},
     connector::TokenSpeedStream,
     protocol::{
+        handshake::EngineCoreReadyResponse,
         sglang::output::SglangOutput,
         tokenspeed::{
             multimodal::{
@@ -14,7 +15,7 @@ use engine_zmq_client::{
                 TokenSpeedWireModality,
             },
             output::{SlimOutputLayout, TokenSpeedOutput},
-            request::TokenizedGenerateReqInput,
+            request::{TokenSpeedEncodeRequest, TokenizedGenerateReqInput},
             sampling::SamplingParams as TokenSpeedSamplingParams,
         },
     },
@@ -346,6 +347,34 @@ pub enum GridTensors {
 }
 
 impl GridTensors {
+    /// From the facts a TokenSpeed engine declares at its handshake (the same
+    /// facts a launcher hands the Rust servicer): the layout facts travel
+    /// together, so an engine that declares only some of them declares none,
+    /// and an engine that declares nothing keeps the conservative reading
+    /// ([`Self::Positions`]).
+    pub fn declared(ready: &EngineCoreReadyResponse) -> Self {
+        let layout = match (
+            ready.spatial_merge_size,
+            ready.image_token_id,
+            ready.video_token_id,
+        ) {
+            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                Some(MropeLayout {
+                    spatial_merge_size,
+                    image_token_id,
+                    video_token_id,
+                })
+            }
+            _ => None,
+        };
+        Self::for_model(
+            &ready.architectures,
+            ready.model_type.as_deref().unwrap_or_default(),
+            ready.mrope_positions,
+            layout,
+        )
+    }
+
     /// From the launcher's model facts: the checkpoint's `architectures` and
     /// `model_type` (the engine's own dispatch picks the Qwen3.5 rule by
     /// them, [`qwen35_lineage`]), its `mrope_positions` reading of the text
@@ -424,6 +453,7 @@ pub(crate) fn translate_request_tokenspeed_for(
         bootstrap_room,
         req.data_parallel_rank,
         ranks.len(),
+        ranks.is_decode(),
         &req.request_id,
     )? {
         Some(rank) => Some(ranks.index_of(rank).ok_or_else(|| {
@@ -591,11 +621,20 @@ impl LogprobColumns {
 /// one) is reached by its indices in order, which the headless launch
 /// numbers 0..n in rank order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RankIndices(Vec<u32>);
+pub(crate) struct RankIndices {
+    indices: Vec<u32>,
+    /// Whether every rank declared itself a decode engine, which takes a
+    /// disaggregated request on the rank it is pinned to ([`rendezvous_rank`]).
+    decode: bool,
+}
 
 impl RankIndices {
     /// The ranks behind `engines`, each read at its handshake.
     pub(crate) fn of(engines: &[ConnectedEngine]) -> Self {
+        let decode = !engines.is_empty()
+            && engines
+                .iter()
+                .all(|engine| engine.ready_response.disaggregation_role() == Some("decode"));
         let mut declared: Vec<(u32, u32)> = engines
             .iter()
             .filter_map(|engine| {
@@ -612,47 +651,71 @@ impl RankIndices {
                 .enumerate()
                 .all(|(rank, (declared_rank, _))| u32::try_from(rank) == Ok(*declared_rank));
         if permutation {
-            return Self(declared.into_iter().map(|(_, index)| index).collect());
+            return Self {
+                indices: declared.into_iter().map(|(_, index)| index).collect(),
+                decode,
+            };
         }
         let mut indices: Vec<u32> = engines
             .iter()
             .filter_map(|engine| engine.engine_id.engine_index())
             .collect();
         indices.sort_unstable();
-        Self(indices)
+        Self { indices, decode }
     }
 
-    /// The indices in rank order, as given.
+    /// The indices in rank order, as given, of an engine that is not a
+    /// decode engine.
     #[cfg(test)]
     pub(crate) fn new(indices_by_rank: Vec<u32>) -> Self {
-        Self(indices_by_rank)
+        Self {
+            indices: indices_by_rank,
+            decode: false,
+        }
+    }
+
+    /// The indices in rank order, as given, of a decode engine.
+    #[cfg(test)]
+    pub(crate) fn decode(indices_by_rank: Vec<u32>) -> Self {
+        Self {
+            indices: indices_by_rank,
+            decode: true,
+        }
     }
 
     /// How many ranks there are: the engine's `dp_size` for the residue.
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.indices.len()
+    }
+
+    /// Whether the ranks are a decode engine's.
+    pub(crate) fn is_decode(&self) -> bool {
+        self.decode
     }
 
     /// The engine index that is rank `rank`, `None` past the last rank.
     pub(crate) fn index_of(&self, rank: u32) -> Option<u32> {
-        self.0.get(usize::try_from(rank).ok()?).copied()
+        self.indices.get(usize::try_from(rank).ok()?).copied()
     }
 }
 
 /// The attention data-parallel rank a request goes to, the engine's own
 /// dispatch rule over `ranks` connected ranks (its data-parallel controller
-/// and input processor, which the direct wire bypasses): a disaggregated
-/// request (one with a `bootstrap_room`) goes to `room % ranks` on the
-/// prefill side as on the decode side, since the decode side's receiver
-/// locates the KV on the prefill group of that residue; a pin that disagrees
-/// is logged and ignored, never refused. Outside disaggregation an in-range
-/// pin is honoured and an out-of-range one refused as the engine refuses it.
-/// A single rank takes everything, pin or not, and `None` leaves an unpinned
-/// request to the least-loaded selection.
+/// and input processor, which the direct wire bypasses). A disaggregated
+/// request (one with a `bootstrap_room`) goes to `room % ranks` on a prefill
+/// engine, since the decode side's receiver locates the KV on the prefill
+/// rank of that residue: a pin that disagrees is logged and ignored, never
+/// refused. A `decode` engine finds the prefill rank from the room on any of
+/// its ranks, so it takes a disaggregated request on its pin, and on the
+/// room's residue without one. An in-range pin is otherwise honoured and an
+/// out-of-range one refused as the engine refuses it. A single rank takes
+/// everything, pin or not, and `None` leaves an unpinned aggregated request
+/// to the least-loaded selection.
 pub(crate) fn rendezvous_rank(
     bootstrap_room: Option<i64>,
     pin: Option<i32>,
     ranks: usize,
+    decode: bool,
     request_id: &str,
 ) -> Result<Option<u32>, String> {
     let Ok(ranks) = u32::try_from(ranks) else {
@@ -661,7 +724,16 @@ pub(crate) fn rendezvous_rank(
     if ranks <= 1 {
         return Ok(None);
     }
+    let pinned = |pin: i32| match u32::try_from(pin) {
+        Ok(rank) if rank < ranks => Ok(Some(rank)),
+        _ => Err(format!(
+            "data_parallel_rank must be in [0, {ranks}), got {pin}"
+        )),
+    };
     if let Some(room) = bootstrap_room {
+        if let (true, Some(pin)) = (decode, pin) {
+            return pinned(pin);
+        }
         let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
         if let Some(pin) = pin {
             if u32::try_from(pin).ok() != Some(rank) {
@@ -671,7 +743,7 @@ pub(crate) fn rendezvous_rank(
                     bootstrap_room = room,
                     dp_size = ranks,
                     "data_parallel_rank conflicts with the bootstrap_room residue; the room \
-                     stays authoritative on a disaggregated request, the pin is ignored"
+                     stays authoritative on a prefill engine, the pin is ignored"
                 );
             }
         }
@@ -679,12 +751,7 @@ pub(crate) fn rendezvous_rank(
     }
     match pin {
         None => Ok(None),
-        Some(pin) => match u32::try_from(pin) {
-            Ok(rank) if rank < ranks => Ok(Some(rank)),
-            _ => Err(format!(
-                "data_parallel_rank must be in [0, {ranks}), got {pin}"
-            )),
-        },
+        Some(pin) => pinned(pin),
     }
 }
 
@@ -721,40 +788,10 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
         // Unknown values are rejected, mirroring the gRPC servicer's
         // `_modality_from_proto`.
-        let modality = match item.modality() {
-            common::Modality::Image => TokenSpeedWireModality::Image,
-            common::Modality::Video => TokenSpeedWireModality::Video,
-            common::Modality::Audio => TokenSpeedWireModality::Audio,
-            common::Modality::Unspecified => {
-                return Err("multimodal item carried an unspecified modality".to_string());
-            }
-        };
-        if item.content_hash.is_empty() {
-            return Err(
-                "multimodal item carried no content hash; the engine pad value derives from it"
-                    .to_string(),
-            );
-        }
-        // u64 little-endian fold of the leading hash bytes — the same fold the
-        // gRPC servicer applies (`int.from_bytes(content_hash[:8], "little")`),
-        // so an item hashes identically on both transports.
-        let mut hash_bytes = [0u8; 8];
-        for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
-            *dst = *src;
-        }
-        let hash = u64::from_le_bytes(hash_bytes);
-        let pad_value = mm_pad_value(modality, hash);
-
-        if item.placeholders.is_empty() {
-            return Err("multimodal item carried no placeholders".to_string());
-        }
-        let mut offsets = Vec::with_capacity(item.placeholders.len());
-        for placeholder in &item.placeholders {
-            if placeholder.length == 0 {
-                return Err("multimodal placeholder length must be > 0".to_string());
-            }
-            let start = placeholder.offset as usize;
-            let end = start + placeholder.length as usize - 1;
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        for &(start, end) in &offsets {
+            let (start, end) = (start as usize, end as usize);
             if end >= input_ids.len() {
                 return Err(format!(
                     "multimodal placeholder [{start}, {end}] exceeds the {} prompt tokens",
@@ -764,7 +801,6 @@ pub(crate) fn translate_tokenspeed_multimodal(
             for id in &mut input_ids[start..=end] {
                 *id = pad_value;
             }
-            offsets.push((start as u64, end as u64));
         }
         match modality {
             TokenSpeedWireModality::Image => {
@@ -865,6 +901,125 @@ pub(crate) fn translate_tokenspeed_multimodal(
             mrope_position_delta_scalar,
         },
     ))
+}
+
+/// A multimodal item's wire identity: its modality (the proto and engine
+/// enums disagree, so it is translated, never passed through; an unknown value
+/// is refused as the gRPC servicer's `_modality_from_proto` refuses it), its
+/// hash (the u64 little-endian fold of the leading content-hash bytes, the
+/// fold the gRPC servicer applies with `int.from_bytes(content_hash[:8],
+/// "little")`, so an item hashes identically on both transports) and the pad
+/// value the engine derives from the hash.
+fn mm_item_identity(
+    item: &tokenspeed_proto::MultimodalItem,
+) -> Result<(TokenSpeedWireModality, u64, u32), String> {
+    let modality = match item.modality() {
+        common::Modality::Image => TokenSpeedWireModality::Image,
+        common::Modality::Video => TokenSpeedWireModality::Video,
+        common::Modality::Audio => TokenSpeedWireModality::Audio,
+        common::Modality::Unspecified => {
+            return Err("multimodal item carried an unspecified modality".to_string());
+        }
+    };
+    if item.content_hash.is_empty() {
+        return Err(
+            "multimodal item carried no content hash; the engine pad value derives from it"
+                .to_string(),
+        );
+    }
+    let mut hash_bytes = [0u8; 8];
+    for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
+        *dst = *src;
+    }
+    let hash = u64::from_le_bytes(hash_bytes);
+    Ok((modality, hash, mm_pad_value(modality, hash)))
+}
+
+/// An item's placeholder spans as the engine's inclusive `offsets`; an item
+/// without placeholders, or a placeholder of length 0, is refused as the gRPC
+/// servicer refuses it. The spans are not checked against a prompt here: the
+/// generate path checks them against its ids, an encode request has none.
+fn mm_item_offsets(
+    placeholders: &[tokenspeed_proto::PlaceholderRange],
+) -> Result<Vec<(u64, u64)>, String> {
+    if placeholders.is_empty() {
+        return Err("multimodal item carried no placeholders".to_string());
+    }
+    placeholders
+        .iter()
+        .map(|placeholder| {
+            if placeholder.length == 0 {
+                return Err("multimodal placeholder length must be > 0".to_string());
+            }
+            let start = u64::from(placeholder.offset);
+            Ok((start, start + u64::from(placeholder.length) - 1))
+        })
+        .collect()
+}
+
+/// The encode worker's own rendezvous, which every encode request names: the
+/// worker hosts the transfer the prefill side pulls the embedding from, at
+/// its host and `--disaggregation-bootstrap-port` (the gRPC servicer fills
+/// them the same way, from the launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeRendezvous {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+}
+
+/// Translate an `Encode` RPC into the encode worker's wire request, with the
+/// gRPC servicer's rules: `mm_inputs` is required and carries exactly one
+/// item with exactly one room assignment (the engine's request names one
+/// room), the item's feature is required (the worker runs the tower on it;
+/// SHM and remote payloads are refused as on the generate path), its hash,
+/// pad value and offsets are the generate path's. An empty request id is
+/// refused rather than invented: the id names the request in the worker's
+/// log and nothing answers it.
+pub fn translate_encode_request(
+    req: smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest,
+    rendezvous: &EncodeRendezvous,
+) -> Result<TokenSpeedEncodeRequest, String> {
+    if req.request_id.is_empty() {
+        return Err("request_id is required".to_string());
+    }
+    let Some(mm) = req.mm_inputs else {
+        return Err("EncodeRequest.mm_inputs is required".to_string());
+    };
+    if mm.items.len() != 1 || req.items.len() != 1 {
+        return Err(
+            "EncodeRequest must contain exactly one mm item and one room assignment".to_string(),
+        );
+    }
+    let bootstrap_room = req.items[0].bootstrap_room;
+    let mut items = Vec::with_capacity(1);
+    for item in mm.items {
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        let Some(encoder_input) = item.encoder_input else {
+            return Err("encode MultimodalItem carried no encoder_input".to_string());
+        };
+        let feature = Some(wire_tensor_tokenspeed(encoder_input)?);
+        let mut model_specific_data = BTreeMap::new();
+        for (name, tensor) in item.model_specific_tensors {
+            model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
+        }
+        items.push(TokenSpeedWireMmItem {
+            modality,
+            hash,
+            pad_value,
+            offsets,
+            feature,
+            model_specific_data,
+            encode_handshake: None,
+        });
+    }
+    Ok(TokenSpeedEncodeRequest {
+        request_id: req.request_id,
+        bootstrap_host: rendezvous.bootstrap_host.clone(),
+        bootstrap_port: rendezvous.bootstrap_port,
+        bootstrap_room,
+        items,
+    })
 }
 
 /// Convert an inline proto tensor to the wire `(dtype, shape, data)` tuple,
@@ -1461,37 +1616,66 @@ mod tests {
     }
 
     /// Placement is the engine's own dispatch rule: a disaggregated request
-    /// goes to its room's residue on either side (a disagreeing pin is
-    /// ignored), an aggregated one to its pin when in range (out of range is
-    /// the engine's refusal), a single rank takes everything, and an
-    /// unpinned aggregated request is left to the least-loaded selection.
+    /// goes to its room's residue on a prefill engine (a disagreeing pin is
+    /// ignored) and to its pin on a decode engine, an aggregated one to its
+    /// pin when in range (out of range is the engine's refusal), a single
+    /// rank takes everything, and an unpinned aggregated request is left to
+    /// the least-loaded selection.
     #[test]
     fn tokenspeed_places_a_request_as_the_engines_dispatcher_would() {
-        assert_eq!(rendezvous_rank(Some(7), None, 2, "r").unwrap(), Some(1));
-        assert_eq!(rendezvous_rank(Some(8), None, 2, "r").unwrap(), Some(0));
         assert_eq!(
-            rendezvous_rank(Some(7), Some(0), 2, "r").unwrap(),
+            rendezvous_rank(Some(7), None, 2, false, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(8), None, 2, false, "r").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, false, "r").unwrap(),
             Some(1),
             "the room stays authoritative over the pin"
         );
         assert_eq!(
-            rendezvous_rank(Some(-3), None, 4, "r").unwrap(),
+            rendezvous_rank(Some(-3), None, 4, false, "r").unwrap(),
             Some(1),
             "a negative room folds as Python's % does"
         );
-        assert_eq!(rendezvous_rank(Some(7), Some(1), 1, "r").unwrap(), None);
-        assert_eq!(rendezvous_rank(None, Some(1), 2, "r").unwrap(), Some(1));
-        assert_eq!(rendezvous_rank(None, None, 2, "r").unwrap(), None);
         assert_eq!(
-            rendezvous_rank(None, Some(5), 1, "r").unwrap(),
+            rendezvous_rank(Some(7), Some(1), 1, false, "r").unwrap(),
+            None
+        );
+        assert_eq!(
+            rendezvous_rank(None, Some(1), 2, false, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(rendezvous_rank(None, None, 2, false, "r").unwrap(), None);
+        assert_eq!(
+            rendezvous_rank(None, Some(5), 1, false, "r").unwrap(),
             None,
             "without attention DP the pin is meaningless and dropped"
         );
         assert_eq!(
-            rendezvous_rank(None, Some(2), 2, "r").unwrap_err(),
+            rendezvous_rank(None, Some(2), 2, false, "r").unwrap_err(),
             "data_parallel_rank must be in [0, 2), got 2"
         );
-        assert!(rendezvous_rank(None, Some(-1), 2, "r").is_err());
+        assert!(rendezvous_rank(None, Some(-1), 2, false, "r").is_err());
+
+        // A decode engine takes a disaggregated request on its pin (any of
+        // its ranks finds the prefill rank from the room), on the room's
+        // residue without one, and refuses an out-of-range pin.
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, true, "r").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), None, 2, true, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(2), 2, true, "r").unwrap_err(),
+            "data_parallel_rank must be in [0, 2), got 2"
+        );
 
         // Through the translation, over two ranks whose engine indices are
         // the reverse of their ranks (rank 0 dialled in as index 1): the
@@ -1524,6 +1708,22 @@ mod tests {
             wire.data_parallel_rank,
             Some(1),
             "room 4 is rank 0 on two ranks, which is index 1"
+        );
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.data_parallel_rank = Some(1);
+        req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &RankIndices::decode(vec![1, 0]),
+            LogprobColumns::default(),
+        )
+        .expect("a pinned decode request");
+        assert_eq!(
+            wire.data_parallel_rank,
+            Some(0),
+            "a decode engine takes rank 1, which is index 0, whatever the room"
         );
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(2);
@@ -1579,6 +1779,20 @@ mod tests {
             "declared ranks over arbitrary indices"
         );
         assert_eq!(RankIndices::of(&[]).len(), 0);
+        assert!(!swapped.is_decode());
+
+        // A group whose every rank declares the decode role is a decode
+        // engine's.
+        let decode = |index: u32| ConnectedEngine {
+            engine_id: EngineId::from_engine_index(index),
+            ready_response: EngineCoreReadyResponse {
+                data_parallel_rank: index,
+                disaggregation_mode: Some("decode".to_string()),
+                ..default_ready_response()
+            },
+        };
+        assert!(RankIndices::of(&[decode(0), decode(1)]).is_decode());
+        assert!(!RankIndices::of(&[decode(0), engine(1, 1)]).is_decode());
     }
 
     /// An EPD prefill request: each named item carries its encode rendezvous
@@ -2100,6 +2314,36 @@ mod tests {
             .collect()
     }
 
+    /// The facts a TokenSpeed engine declares at its handshake pick the same
+    /// rule a launcher's facts do: a Qwen3.5 checkpoint with its layout gets
+    /// the position table, one that declares only part of the layout gets
+    /// none, and an engine that declares nothing keeps the conservative
+    /// reading.
+    #[test]
+    fn the_facts_an_engine_declares_pick_the_position_rule() {
+        let mut ready = default_ready_response();
+        assert_eq!(GridTensors::declared(&ready), GridTensors::Positions);
+        ready.model_type = Some("qwen3_5".to_string());
+        ready.architectures = vec!["Qwen3_5ForConditionalGeneration".to_string()];
+        ready.mrope_positions = Some(true);
+        ready.spatial_merge_size = Some(QWEN35.spatial_merge_size);
+        ready.image_token_id = Some(QWEN35.image_token_id);
+        assert_eq!(
+            GridTensors::declared(&ready),
+            GridTensors::Qwen35PositionsUnavailable
+        );
+        ready.video_token_id = Some(QWEN35.video_token_id);
+        assert_eq!(
+            GridTensors::declared(&ready),
+            GridTensors::Qwen35Positions(QWEN35)
+        );
+        // A model whose rope config is plain lays out patches only.
+        let mut patches = default_ready_response();
+        patches.architectures = vec!["Llama4ForConditionalGeneration".to_string()];
+        patches.mrope_positions = Some(false);
+        assert_eq!(GridTensors::declared(&patches), GridTensors::PatchLayout);
+    }
+
     /// A Qwen3.5-lineage checkpoint's grid feeds the position table this
     /// translation computes from the ORIGINAL ids (the engine's rule checks
     /// the placeholder spans before the pad values replace them): the
@@ -2612,5 +2856,104 @@ mod tests {
             }
         }
         engine_task.await.unwrap();
+    }
+
+    fn encode_proto(room: i64) -> smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest {
+        use smg_grpc_client::tokenspeed_encoder_proto::{EncodeItemAssignment, EncodeRequest};
+
+        let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| tokenspeed_proto::TensorData {
+            dtype: dtype.to_string(),
+            shape,
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes.into())),
+        };
+        EncodeRequest {
+            request_id: "e1".to_string(),
+            mm_inputs: Some(tokenspeed_proto::MultimodalInputs {
+                items: vec![tokenspeed_proto::MultimodalItem {
+                    modality: common::Modality::Image as i32,
+                    content_hash: 0xDEAD_BEEFu64.to_le_bytes().to_vec(),
+                    encoder_input: Some(tensor("bfloat16", vec![3, 2], (0u8..12).collect())),
+                    model_specific_tensors: [(
+                        "vit_grid".to_string(),
+                        tensor(
+                            "uint32",
+                            vec![1, 3],
+                            vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                        offset: 1,
+                        length: 3,
+                    }],
+                    placeholder_token_id: Some(9),
+                }],
+            }),
+            items: vec![EncodeItemAssignment {
+                bootstrap_room: room,
+            }],
+        }
+    }
+
+    /// An `Encode` translates with the gRPC servicer's rules: the worker's
+    /// own rendezvous and the room, the item's identity as the generate path
+    /// derives it (the content-hash fold, the pad value, the placeholder
+    /// spans as offsets), its feature and model-specific tensors; no
+    /// `mm_inputs`, two items, no room, no feature, an empty request id are
+    /// refused in the servicer's words.
+    #[test]
+    fn an_encode_request_translates_with_the_grpc_servicers_rules() {
+        let rendezvous = EncodeRendezvous {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+        };
+        let wire = translate_encode_request(encode_proto(41), &rendezvous).expect("translates");
+        assert_eq!(wire.request_id, "e1");
+        assert_eq!(wire.bootstrap_host, "10.0.0.9");
+        assert_eq!(wire.bootstrap_port, 8998);
+        assert_eq!(wire.bootstrap_room, 41);
+        assert_eq!(wire.items.len(), 1);
+        let item = &wire.items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Image);
+        assert_eq!(item.hash, 0xDEAD_BEEF);
+        assert_eq!(
+            item.pad_value,
+            mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF)
+        );
+        assert_eq!(item.offsets, vec![(1, 3)]);
+        assert!(item.feature.is_some());
+        assert!(item.model_specific_data.contains_key("vit_grid"));
+        assert_eq!(item.encode_handshake, None);
+
+        let mut no_inputs = encode_proto(1);
+        no_inputs.mm_inputs = None;
+        let mut two_items = encode_proto(2);
+        let twin = two_items.mm_inputs.as_ref().unwrap().items[0].clone();
+        two_items.mm_inputs.as_mut().unwrap().items.push(twin);
+        let mut no_room = encode_proto(3);
+        no_room.items.clear();
+        let mut no_feature = encode_proto(4);
+        no_feature.mm_inputs.as_mut().unwrap().items[0].encoder_input = None;
+        let mut no_id = encode_proto(5);
+        no_id.request_id.clear();
+        for (request, words) in [
+            (no_inputs, "EncodeRequest.mm_inputs is required"),
+            (
+                two_items,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (
+                no_room,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (no_feature, "encode MultimodalItem carried no encoder_input"),
+            (no_id, "request_id is required"),
+        ] {
+            assert_eq!(
+                translate_encode_request(request, &rendezvous).unwrap_err(),
+                words
+            );
+        }
     }
 }

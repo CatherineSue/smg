@@ -1480,6 +1480,30 @@ impl<P: EngineProtocol> Client<P> {
             .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
             .await
     }
+
+    /// [`notify`](Self::notify) under a request-type frame of the caller's
+    /// choosing, with `aux_frames` behind the payload: a message of the
+    /// engine's vocabulary outside the add/abort pair that the engine consumes
+    /// itself (an encode worker's encode request, the largest payload this
+    /// wire carries). Nothing answers it, no stream is opened, no registration
+    /// or in-flight slot is taken; the frame is admitted against the input
+    /// queue bound and counted while it waits, as an add frame is (see
+    /// [`ClientInner::admit_add`]): once the engine has stopped reading for
+    /// a whole send window, a frame that would take the waiting payload past
+    /// the bound is refused at once rather than parked and delivered later.
+    pub async fn send_typed(
+        &self,
+        engine_id: &EngineId,
+        request_type: Bytes,
+        payload: Vec<u8>,
+        aux_frames: Vec<Bytes>,
+    ) -> Result<()> {
+        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        self.inner.admit_add(bytes)?;
+        self.inner
+            .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
+            .await
+    }
 }
 
 impl<P: EngineProtocol> Drop for Client<P> {

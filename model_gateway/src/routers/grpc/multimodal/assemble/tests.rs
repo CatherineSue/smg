@@ -1091,7 +1091,7 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
     let intermediate =
         MultimodalIntermediate::try_new(vec![image_batch, video_batch, audio_batch]).unwrap();
     let routing_hashes = encode_routing_hashes(&intermediate).unwrap();
-    let assembled = assemble_tokenspeed_for_encode(&intermediate, None).unwrap();
+    let assembled = assemble_tokenspeed_for_encode(&intermediate, None, false).unwrap();
 
     assert_eq!(assembled.items.len(), 3);
     assert_eq!(assembled.items[0].modality, TokenSpeedModality::Audio);
@@ -1108,6 +1108,48 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
             .map(|item| item.content_hash.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// An encode server on the ZMQ lane takes its tensors inline: an inline
+/// encode assembly writes no /dev/shm segment even for an encode worker whose
+/// spec asks for shared memory, which the gRPC encoder's assembly honours.
+#[test]
+#[cfg(target_os = "linux")]
+fn an_inline_encode_assembly_writes_no_shared_memory() {
+    use openai_protocol::worker::{TransportMode, WorkerSpec};
+
+    use crate::{
+        routers::grpc::proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
+        worker::{BasicWorkerBuilder, Worker},
+    };
+
+    if !mm_shm_dev_writable() {
+        return;
+    }
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::from_spec(WorkerSpec {
+            multimodal_tensor_transport: Some(TransportMode::Shm),
+            multimodal_shm_min_bytes: Some(0),
+            ..WorkerSpec::new("grpc://encode:9000")
+        })
+        .build(),
+    );
+    let workers = WorkerSelection::Single { worker };
+    let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
+
+    let inline = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), true).unwrap();
+    assert!(!inline.shm_enabled);
+    assert!(matches!(
+        inline.items[0].encoder_input.storage,
+        TokenSpeedTensorStorage::Inline(_)
+    ));
+
+    let shared = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), false).unwrap();
+    assert!(matches!(
+        shared.items[0].encoder_input.storage,
+        TokenSpeedTensorStorage::Shm(_)
+    ));
+    cleanup_tokenspeed_items_encoder_shm(&shared.items, None);
 }
 
 #[test]

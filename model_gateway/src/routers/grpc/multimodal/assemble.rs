@@ -441,15 +441,25 @@ fn assemble_tokenspeed(
     assemble_tokenspeed_with_options(intermediate, options, None)
 }
 
+/// Assemble the items an EPD request's encode workers run the tower on, with
+/// their pixels; `inline` assembles without /dev/shm, for an encode server on
+/// the ZMQ lane, which carries the tensors inline.
 pub(crate) fn assemble_tokenspeed_for_encode(
     intermediate: &MultimodalIntermediate,
     workers: Option<&WorkerSelection>,
+    inline: bool,
 ) -> Result<TokenSpeedMultimodalData> {
     validate_intermediate(intermediate)?;
     let options = intermediate
         .batches()
         .iter()
-        .map(|batch| tokenspeed_assembly_options(batch.media.modality(), workers, false))
+        .map(|batch| {
+            let options = tokenspeed_assembly_options(batch.media.modality(), workers, false);
+            TokenSpeedAssemblyOptions {
+                shm_enabled: options.shm_enabled && !inline,
+                ..options
+            }
+        })
         .collect();
     assemble_tokenspeed_batches(intermediate.batches(), options)
 }

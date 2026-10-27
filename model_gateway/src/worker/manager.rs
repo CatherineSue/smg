@@ -1311,12 +1311,23 @@ impl WorkerManager {
             .iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .count();
-        // ZMQ engines have no cache-flush RPC; fan out only to workers that can
-        // succeed instead of reporting every ZMQ worker as failed.
-        let (workers, zmq_workers): (Vec<_>, Vec<_>) = all_workers
-            .into_iter()
-            .partition(|w| !matches!(w.connection_mode(), ConnectionMode::Zmq));
-        let zmq_skipped = zmq_workers.len();
+        // A ZMQ engine flushes when its wire carries control calls (an SGLang
+        // scheduler, a TokenSpeed one that declares them); fan out only to
+        // workers that can succeed instead of reporting the others as failed.
+        let mut workers = Vec::with_capacity(all_workers.len());
+        for worker in all_workers {
+            if matches!(worker.connection_mode(), ConnectionMode::Zmq)
+                && !matches!(
+                    worker.get_backend_client().await,
+                    Ok(Some(client)) if client.carries_admin_calls()
+                )
+            {
+                continue;
+            }
+            workers.push(worker);
+        }
+        let zmq_skipped = total_workers - workers.len();
+        // The ZMQ engines that flush ride the gRPC pipeline's admin path.
         let grpc_workers = total_workers - http_workers - zmq_skipped;
 
         if workers.is_empty() {

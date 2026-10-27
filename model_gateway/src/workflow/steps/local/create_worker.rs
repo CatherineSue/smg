@@ -198,7 +198,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
-        validate_zmq_worker_type(*connection_mode, config.worker_type, &config.url)?;
+        validate_zmq_worker_type(
+            *connection_mode,
+            runtime_type,
+            config.worker_type,
+            &config.url,
+        )?;
 
         // A grouped ZMQ worker (`dp_size: N` on the spec) awaits N engines on
         // one socket set. Every ZMQ runtime routes per rank: vLLM by in-request
@@ -940,6 +945,7 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
         || url.starts_with("grpc://")
         || url.starts_with("grpcs://")
         || url.starts_with("ipc://")
+        || url.starts_with("tcp://")
     {
         url.to_string()
     } else {
@@ -953,36 +959,38 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 
 /// Reject a disaggregated worker the ZMQ path cannot serve.
 ///
-/// The ZMQ wire carries no KV-transfer rendezvous: neither the vLLM
-/// `EngineCoreRequest` nor the TokenSpeed `TokenizedGenerateReqInput` has a
-/// field for the bootstrap info PD injects, so a ZMQ prefill/decode worker would
-/// silently drop it and degrade to a decode-side recompute or a stalled KV
-/// wait. Encode fares no better: encode dispatch is a gRPC encoder RPC a
-/// direct-ZMQ worker has no path for. `Regular` is therefore the only role the
-/// ZMQ lane serves, and every disaggregated worker is rejected at registration —
-/// matching the gRPC-only PD/EPD selection folds, which would otherwise leave
-/// such a worker registered but never selected.
+/// TokenSpeed's wire carries the prefill/decode rendezvous on its generate
+/// request (the bootstrap slots) and takes an encode server's encode request,
+/// so a TokenSpeed ZMQ worker serves every role. vLLM's `EngineCoreRequest`
+/// has no field for the bootstrap info PD injects, and the other runtimes'
+/// encode dispatch is a gRPC encoder RPC, so for them `Regular` is the only
+/// role the ZMQ lane serves. A worker of a role its lane cannot serve is
+/// rejected at registration rather than registered and never selected.
 fn validate_zmq_worker_type(
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     worker_type: WorkerType,
     url: &str,
 ) -> Result<(), WorkflowError> {
-    if connection_mode == ConnectionMode::Zmq
-        && matches!(
-            worker_type,
-            WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode
-        )
-    {
-        return Err(WorkflowError::StepFailed {
-            step_id: StepId::new("create_worker"),
-            message: format!(
-                "ZMQ worker {url} cannot serve worker type {worker_type}: the direct-ZMQ \
-                 backend carries no KV-transfer metadata and has no encode path, so \
-                 encode/prefill/decode disaggregation requires a gRPC worker"
-            ),
-        });
+    if connection_mode != ConnectionMode::Zmq {
+        return Ok(());
     }
-    Ok(())
+    let reason = match worker_type {
+        WorkerType::Regular => return Ok(()),
+        _ if runtime_type == RuntimeType::TokenSpeed => return Ok(()),
+        WorkerType::Prefill | WorkerType::Decode => format!(
+            "the {runtime_type} direct-ZMQ backend carries no KV-transfer metadata, so \
+             prefill/decode disaggregation requires a gRPC worker or a TokenSpeed engine"
+        ),
+        WorkerType::Encode => format!(
+            "the {runtime_type} direct-ZMQ backend has no encode path, so encode \
+             disaggregation requires a gRPC worker or a TokenSpeed encode server"
+        ),
+    };
+    Err(WorkflowError::StepFailed {
+        step_id: StepId::new("create_worker"),
+        message: format!("ZMQ worker {url} cannot serve worker type {worker_type}: {reason}"),
+    })
 }
 
 /// The labels of one dp-aware rank worker: the engine's labels as they are,
@@ -2205,13 +2213,22 @@ mod tests {
 
     #[test]
     fn zmq_disaggregated_workers_are_rejected_as_a_create_worker_failure() {
-        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+        let refused = [
+            (RuntimeType::Vllm, WorkerType::Prefill),
+            (RuntimeType::Vllm, WorkerType::Decode),
+            (RuntimeType::Vllm, WorkerType::Encode),
+            (RuntimeType::Sglang, WorkerType::Prefill),
+            (RuntimeType::Sglang, WorkerType::Decode),
+            (RuntimeType::Sglang, WorkerType::Encode),
+        ];
+        for (runtime, worker_type) in refused {
             let err = validate_zmq_worker_type(
                 ConnectionMode::Zmq,
+                runtime,
                 worker_type,
                 "ipc:///tmp/smg-zmq/ts0.ipc",
             )
-            .expect_err("ZMQ encode/prefill/decode must be rejected");
+            .expect_err("a role the ZMQ lane cannot serve must be rejected");
             match err {
                 WorkflowError::StepFailed { step_id, message } => {
                     assert_eq!(step_id, StepId::new("create_worker"));
@@ -2224,18 +2241,37 @@ mod tests {
             }
         }
 
-        // Regular is the one role the ZMQ lane serves; every worker type over
-        // the other transports stays accepted.
-        validate_zmq_worker_type(
-            ConnectionMode::Zmq,
-            WorkerType::Regular,
-            "ipc:///tmp/smg-zmq/ts0.ipc",
-        )
-        .expect("ZMQ regular workers are the supported case");
+        // Every runtime's ZMQ lane serves Regular; a TokenSpeed engine, whose
+        // generate request carries the rendezvous and whose encode server takes
+        // the encode request, serves every role; every worker type over the
+        // other transports stays accepted.
+        for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
+            validate_zmq_worker_type(
+                ConnectionMode::Zmq,
+                runtime,
+                WorkerType::Regular,
+                "ipc:///tmp/smg-zmq/ts0.ipc",
+            )
+            .expect("ZMQ regular workers are the supported case");
+        }
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
+            validate_zmq_worker_type(
+                ConnectionMode::Zmq,
+                RuntimeType::TokenSpeed,
+                worker_type,
+                "ipc:///tmp/smg-zmq/ts0.ipc",
+            )
+            .expect("a TokenSpeed ZMQ worker serves every role");
+        }
         for mode in [ConnectionMode::Http, ConnectionMode::Grpc] {
             for worker_type in [WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode] {
-                validate_zmq_worker_type(mode, worker_type, "grpc://worker:8080")
-                    .expect("non-ZMQ transports serve every worker type");
+                validate_zmq_worker_type(
+                    mode,
+                    RuntimeType::Sglang,
+                    worker_type,
+                    "grpc://worker:8080",
+                )
+                .expect("non-ZMQ transports serve every worker type");
             }
         }
     }
