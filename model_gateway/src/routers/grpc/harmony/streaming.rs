@@ -537,13 +537,19 @@ impl HarmonyStreamingProcessor {
     /// - Other tools → `function_call.*` events
     ///
     /// When no MCP context is provided, all tool calls are treated as function calls.
+    ///
+    /// Answers the iteration's result with the engine's counts the terminal
+    /// frame brought, for the settlement of the iteration's reservation;
+    /// `None` when the stream ended before that frame (a clean EOF): the
+    /// usage the result carries is then the chunks' count at most, and the
+    /// caller keeps the reserved debit instead of settling with it.
     pub async fn process_responses_iteration_stream(
         execution_result: context::ExecutionResult,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
@@ -590,7 +596,7 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         // Phase 1: Drain prefill stream, for the client (see `next_response`):
         // a client that leaves during the prefill ends both sides at once. The
         // client's prompt-side usage is the prefill side's prefix-cache hit:
@@ -643,7 +649,7 @@ impl HarmonyStreamingProcessor {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         pd_timing: Option<context::PdTiming>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         let mut decode = ResponsesDecode::new(pd_timing)?;
         // Each read races the engine against the client's leaving (see `next_response`).
         loop {
@@ -681,7 +687,8 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
-        Ok(decode.result(emitter))
+        let counts = decode.settlement_counts();
+        Ok((decode.result(emitter), counts))
     }
 }
 
@@ -722,6 +729,8 @@ struct ResponsesDecode {
     /// The PD dispatch instants, in PD mode, until the first decode frame records the PD
     /// first-token pair against them (the iteration records no streaming TTFT of its own).
     pd_timing: Option<context::PdTiming>,
+    /// Whether the terminal frame came: the counters above are the engine's only then.
+    completed: bool,
 }
 
 impl ResponsesDecode {
@@ -745,6 +754,7 @@ impl ResponsesDecode {
             spec_accepted: 0,
             spec_drafted: 0,
             pd_timing,
+            completed: false,
         })
     }
 
@@ -970,6 +980,7 @@ impl ResponsesDecode {
         self.engine_reasoning_tokens = complete.reasoning_tokens();
         self.spec_accepted = complete.spec_accepted_tokens();
         self.spec_drafted = complete.spec_draft_tokens();
+        self.completed = true;
 
         // Finalize parser and get complete output
         // Responses API: no user-specified stop sequences
@@ -1104,21 +1115,30 @@ impl ResponsesDecode {
         self.close_calls(emitter, tx, session).await;
     }
 
+    /// The engine's counts the stream brought (the terminal frame's counters).
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt_tokens,
+            completion: self.completion_tokens,
+            cached: self.cached_tokens,
+            reasoning: self.engine_reasoning_tokens,
+            spec_accepted: self.spec_accepted,
+            spec_drafted: self.spec_drafted,
+        }
+    }
+
+    /// The counts the iteration's reservation settles with: the terminal frame's, so none when the
+    /// stream ended before it (a clean EOF). The caller then keeps the reserved debit, as the chat
+    /// streams do, instead of settling the prompt at zero.
+    fn settlement_counts(&self) -> Option<TokenCounts> {
+        self.completed.then(|| self.counts())
+    }
+
     /// The iteration's result: the calls found, with the analysis and the text so far, or the
     /// completed response; either with the iteration's usage, as the non-streamed iteration
     /// builds it.
     fn result(self, emitter: &ResponseStreamEventEmitter) -> ResponsesIterationResult {
-        let usage = iteration_usage(
-            TokenCounts {
-                prompt: self.prompt_tokens,
-                completion: self.completion_tokens,
-                cached: self.cached_tokens,
-                reasoning: self.engine_reasoning_tokens,
-                spec_accepted: self.spec_accepted,
-                spec_drafted: self.spec_drafted,
-            },
-            self.reasoning_token_count,
-        );
+        let usage = iteration_usage(self.counts(), self.reasoning_token_count);
         if let Some(tool_calls) = self.tool_calls.filter(|calls| !calls.is_empty()) {
             return ResponsesIterationResult::ToolCallsFound {
                 tool_calls,
